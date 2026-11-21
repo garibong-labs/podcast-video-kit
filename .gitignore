@@ -1,0 +1,39 @@
+# Private asset bundles and generated workspaces
+assets/
+private/
+runs/
+outputs/
+functional-podcast/
+# Media never belongs in this initial public import
+*.wav
+*.aiff
+*.mp3
+*.m4a
+*.mp4
+*.mov
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.blend
+*.npy
+*.srt
+*.vtt
+*.zip
+# Local credentials/configuration
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+rclone.conf
+*credentials*.json
+*client_secret*.json
+*token*.json
+# Python and OS state
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+*.log

@@ -1,0 +1,31 @@
+{
+  "baseline": "functional-podcast-revoice-swapped.mp4",
+  "sha256": "c9b7aeba12995ef5a631a6bd36779b7573b3e6f7392a616d0240089575ef5917",
+  "duration": 1791.375,
+  "audio_duration": 1791.36,
+  "frames": 42993,
+  "width": 1280,
+  "height": 720,
+  "fps": 24,
+  "changes": [
+    "Add PVK_FONT environment override; no intended visual/timing/audio changes."
+  ],
+  "sources": [
+    {
+      "file": "reference/full-local/render_revoice_swapped.py",
+      "original_sha256": "6957837a0408999d1dc8da47f76928d2b4368cb18e539e035c028471a08b72fe"
+    },
+    {
+      "file": "reference/full-local/mouths.py",
+      "original_sha256": "4e3a26b290533504f9cf244bb88d9ee7ead25a5391259b8a742db05a21ddf28d"
+    },
+    {
+      "file": "reference/full-local/mouth-landmarks-640.json",
+      "original_sha256": "83cab20a1ec962ec89b4deb464d0be1680a00cd6920f7409c99840579eac40cf"
+    },
+    {
+      "file": "reference/full-local/revoice-swapped/verify.py",
+      "original_sha256": "612d6ea448f2a02a7eb35d3eaf67f5a756b6a358853c493687a70882d5ac8666"
+    }
+  ]
+}
