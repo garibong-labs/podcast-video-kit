@@ -29,6 +29,7 @@ instead of clipping or dropping text. Split dense cues or cards upstream.
 from __future__ import annotations
 
 from bisect import bisect_right
+from collections.abc import Iterator
 from dataclasses import dataclass
 import math
 import operator
@@ -227,6 +228,17 @@ class Renderer:
         self, text: str, width: int, height: int, size: int, minimum: int,
         field: str, max_lines: int | None = None, *, preserve_spacing: bool = False,
     ) -> _Text:
+        layout = next(self._fitting_text(
+            text, width, height, size, minimum, max_lines, preserve_spacing=preserve_spacing,
+        ), None)
+        if layout is None:
+            raise ValueError(f"{field} does not fit; shorten the title or split the text")
+        return layout
+
+    def _fitting_text(
+        self, text: str, width: int, height: int, size: int, minimum: int,
+        max_lines: int | None = None, *, preserve_spacing: bool = False,
+    ) -> Iterator[_Text]:
         for point in range(size, minimum - 1, -1):
             font = self._font(point)
             ascent, descent = font.getmetrics()
@@ -242,9 +254,8 @@ class Renderer:
             step = max(ascent + descent, bottom - top) + gap
             block_height = (len(lines) - 1) * step + bottom - top
             if block_height <= height:
-                return _Text(font, tuple((line, box[0]) for line, box in zip(lines, boxes)),
-                             step, top, block_height)
-        raise ValueError(f"{field} does not fit; shorten the title or split the text")
+                yield _Text(font, tuple((line, box[0]) for line, box in zip(lines, boxes)),
+                            step, top, block_height)
 
     def _label(self, draw: ImageDraw.ImageDraw, x: int, y: int, text: str,
                fill: str, size: int = 19) -> None:
@@ -253,10 +264,16 @@ class Renderer:
     def _layout_concept(self, start: float, row: dict) -> tuple[_Text, _Text, _Text]:
         kind = self._fit(row.get("kind", "CONCEPT"), 910, 27, 19, 14,
                          f"scene kind at {start:g}s", max_lines=1)
-        title = self._fit(row["title"], 954, 124, 54, 27, f"scene title at {start:g}s")
-        height = _CONCEPT_TEXT_BOTTOM - _CONCEPT_TITLE_Y - _CONCEPT_BODY_GAP - title.height
-        body = self._fit(row["body"], 954, height, 35, 20, f"scene body at {start:g}s")
-        return kind, title, body
+        # Try the largest title first to preserve cards that already fit. If its
+        # remaining space cannot fit the body at any size, try a smaller title.
+        field = "title"
+        for title in self._fitting_text(row["title"], 954, 124, 54, 27):
+            field = "body"
+            height = _CONCEPT_TEXT_BOTTOM - _CONCEPT_TITLE_Y - _CONCEPT_BODY_GAP - title.height
+            body = next(self._fitting_text(row["body"], 954, height, 35, 20), None)
+            if body is not None:
+                return kind, title, body
+        raise ValueError(f"scene {field} at {start:g}s does not fit; shorten the title or split the text")
 
     def _header(self, draw: ImageDraw.ImageDraw, label: str) -> None:
         draw.rounded_rectangle((57, 44, 64, 76), radius=3, fill="#edaa75")

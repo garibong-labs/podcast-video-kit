@@ -11,12 +11,17 @@ from zipfile import ZipFile
 
 W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
 SPEAKER = re.compile(r'^([AB])\s*[:：]\s*(.*)$')
-NUMBERED = re.compile(r'^(\d+)\s*[.)]\s*\S')
+NUMBERED = re.compile(r'^(\d+)\s*[.)]\s+\S')
 OUTLINE_LEVELS = {str(level): level for level in range(9)}
 
 
 def normalized(text):
     return ''.join(c for c in unicodedata.normalize('NFKC', text).casefold() if c.isalnum())
+
+
+def _heading_key(text):
+    # Runs, tabs and soft line breaks may differ between Word exporters.
+    return ' '.join(unicodedata.normalize('NFC', text).split())
 
 
 def _word_xml(archive, name):
@@ -71,7 +76,8 @@ def script(path, heading):
         text = ''.join((p.text or '') if p.tag == W + 't' else ' '
                        for p in node.iter() if p.tag in {W + 't', W + 'br', W + 'tab'})
         rows.append((text.strip(), _outline(node, styles, default_style, default_outline)))
-    matching = [i for i, (t, _) in enumerate(rows) if normalized(t) == normalized(heading)]
+    key = _heading_key(heading)
+    matching = [i for i, (t, _) in enumerate(rows) if key and _heading_key(t) == key]
     if len(matching) != 1:
         raise ValueError('Expected one script heading; supply the exact heading with --section')
     first = matching[0]
@@ -109,6 +115,10 @@ def read_words(transcript, duration):
         entries = seg.get('words', [])
         if not isinstance(entries, list):
             raise ValueError(f'ASR segments[{i}].words must be an array')
+        segment_text = seg.get('text', '')
+        if not isinstance(segment_text, str):
+            raise ValueError(f'ASR segments[{i}].text must be a string')
+        before = len(words)
         for j, w in enumerate(entries):
             location = f'segments[{i}].words[{j}]'
             if not isinstance(w, dict) or not isinstance(w.get('word'), str):
@@ -133,6 +143,8 @@ def read_words(transcript, duration):
                     raise ValueError(f'ASR {location} has no positive duration; correct its timestamps before aligning')
                 words.append((start, end, text))
                 previous = end
+        if len(words) == before and segment_text.strip():
+            raise ValueError(f'ASR segments[{i}] has text but no usable word timestamps')
     if not words:
         raise ValueError('Expected Whisper JSON with nonempty word timestamps')
     return words
@@ -172,14 +184,27 @@ def align(turns, words):
     return aligned, issues, len(matches)/len(script_text)
 
 
+def _caption_speaker(turns, starts, start, end):
+    j = bisect_right(starts, start) - 1
+    if j < 0 or start >= turns[j]['end']:
+        return ''
+    speaker = turns[j]['speaker']
+    # Adjacent turns by the same speaker can share a word. Across speakers
+    # or an unaligned gap, don't assign the entire word to one speaker.
+    while end > turns[j]['end']:
+        j += 1
+        if (j == len(turns) or turns[j]['speaker'] != speaker
+                or turns[j]['start'] > turns[j - 1]['end']):
+            return ''
+    return speaker
+
+
 def captions(turns, words):
     """Group actual ASR words; unmatched speech is preserved without a speaker label."""
     starts = [t['start'] for t in turns]
     out = []
     for a, b, raw in words:
-        mid = (a+b)/2
-        j = bisect_right(starts, mid)-1
-        speaker = turns[j]['speaker'] if j >= 0 and mid < turns[j]['end'] else ''
+        speaker = _caption_speaker(turns, starts, a, b)
         line = (out[-1]['text'] + raw) if out else raw
         if (out and speaker == out[-1]['speaker'] and a-out[-1]['end'] <= .6
                 and b-out[-1]['start'] <= 5 and len(line.strip()) <= 54):

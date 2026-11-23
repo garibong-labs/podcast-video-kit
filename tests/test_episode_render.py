@@ -190,6 +190,30 @@ class RendererTests(unittest.TestCase):
         self.assertIsNotNone(ImageChops.difference(core1, core3).getbbox())
         self.assertSamePixels(first.frame(24, 0), second.frame(24, 0))
 
+    def test_concept_reduces_title_when_body_cannot_fit(self):
+        title_text = "The sample title takes two lines at the largest font size"
+        body_lines = [f"Line {n}" for n in range(1, 9)]
+        self.assertEqual(len(_wrap(title_text, ImageFont.load_default(size=54), 954, 2)), 2)
+
+        renderer = self.renderer(
+            cues=[cue(0, 2, "A", "Caption stays separate")],
+            scenes=[scene(0, 1, title=title_text, body="\n".join(body_lines))],
+        )
+        _, title, body = renderer._scene_text[0]
+        self.assertGreaterEqual(title.font.size, 27)
+        self.assertLess(title.font.size, 54)
+        self.assertGreaterEqual(body.font.size, 20)
+        self.assertEqual(" ".join(line for line, _ in title.lines), title_text)
+        self.assertEqual([line for line, _ in body.lines], body_lines)
+        self.assertLessEqual(183 + title.height + 25 + body.height, 505)
+        caption_zone = (56, 542, 1224, 702)
+        self.assertSamePixels(renderer.frame(12, 0).crop(caption_zone),
+                              renderer.frame(24, 0).crop(caption_zone))
+
+    def test_concept_keeps_full_type_sizes_when_copy_fits(self):
+        _, title, body = self.renderer(scenes=[scene(0, 1)])._scene_text[0]
+        self.assertEqual((title.font.size, body.font.size), (54, 35))
+
     def test_unattributed_caption_renders_text_without_badge(self):
         renderer = self.renderer(cues=[cue(0, 1, "", "Unattributed words"),
                                        cue(1, 2, "A", "Unattributed words")])

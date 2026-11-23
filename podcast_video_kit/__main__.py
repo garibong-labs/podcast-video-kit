@@ -54,7 +54,7 @@ def duration_wav(path):
     return seconds
 
 
-def transcribe(args, cache):
+def transcribe(args):
     if args.words_json:
         return json.loads(args.words_json.read_text(encoding='utf-8'))
     if not args.whisper_model:
@@ -64,7 +64,9 @@ def transcribe(args, cache):
         raise ValueError('Use an existing trusted Whisper .pt model; no downloads are attempted')
     if args.language is not None and re.fullmatch('[A-Za-z]{2,3}', args.language) is None:
         raise ValueError('--language must be a language code, e.g. ko or en')
-    with TemporaryDirectory(dir=cache) as tmp:
+    # The subprocess emits a raw transcript named after the input WAV. Never
+    # place it under the run directory, which may be inside a Git checkout.
+    with TemporaryDirectory(prefix='podcast-video-kit-') as tmp:
         wav = str(args.narration.resolve())
         command(['whisper', wav, '--model', str(model), '--task', 'transcribe',
                  '--device', 'cpu', '--fp16', 'False', '--word_timestamps', 'True',
@@ -167,7 +169,7 @@ def build(args):
         raise ValueError('Config must be a JSON object with an optional text title')
     out = args.output.resolve()
     out.mkdir(mode=0o700, parents=True, exist_ok=False)
-    transcript = transcribe(args, out)
+    transcript = transcribe(args)
     json_write(out / 'words.json', transcript)
     words = read_words(transcript, float(duration))
     aligned, weak, coverage = align(turns, words)

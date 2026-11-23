@@ -28,6 +28,25 @@ def docx(path, rows, styles=''):
 
 
 class PlanningTests(unittest.TestCase):
+    def test_decimal_note_does_not_truncate_dialogue(self):
+        with tempfile.TemporaryDirectory() as temp:
+            p = Path(temp) / 'example.docx'
+            docx(p, ['7. Script', 'A: First', '8.5% growth', 'B: Second', '8. Appendix', 'A: Outside'])
+            turns, notes = script(p, '7. Script')
+            self.assertEqual([t['text'] for t in turns], ['First', 'Second'])
+            self.assertEqual([n['text'] for n in notes], ['8.5% growth'])
+
+    def test_exact_heading_preserves_punctuation_and_case(self):
+        with tempfile.TemporaryDirectory() as temp:
+            p = Path(temp) / 'example.docx'
+            level = '<w:pPr><w:outlineLvl w:val="0"/></w:pPr>'
+            docx(p, [('C#', level), 'B: Wrong', ('C++', level), 'A: Right', ('Appendix', level), 'B: Outside'])
+            turns, _ = script(p, 'C++')
+            self.assertEqual([t['text'] for t in turns], ['Right'])
+            for heading in ('C', 'c++'):
+                with self.subTest(heading=heading), self.assertRaisesRegex(ValueError, 'exact heading'):
+                    script(p, heading)
+
     def test_section_boundaries_notes_and_repeat_speaker(self):
         with tempfile.TemporaryDirectory() as temp:
             p = Path(temp) / 'example.docx'
@@ -83,6 +102,20 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual([cue['text'] for cue in cues], ['今日は晴れ  です。', '다음'])
         self.assertIn('A: 今日は晴れ  です。\n', srt(cues))
 
+    def test_caption_word_crossing_turns_does_not_claim_one_speaker(self):
+        words = [(0, 1, 'anymore'), (1, 1.5, ' later')]
+        for second_speaker, expected in [('B', ''), ('A', 'A')]:
+            with self.subTest(second_speaker=second_speaker):
+                turns, _, coverage = align([dict(speaker='A', text='any'),
+                                            dict(speaker=second_speaker, text='more later')], words)
+                self.assertEqual(coverage, 1)
+                cues = captions(turns, words)
+                self.assertEqual(cues[0]['speaker'], expected)
+                if not expected:
+                    self.assertEqual(cues[0], dict(start=0, end=1, text='anymore', speaker=''))
+                    self.assertEqual(cues[1]['speaker'], 'B')
+                    self.assertIn('\nanymore\n\n', srt(cues))
+
     def test_alignment_uses_exact_word_endpoints(self):
         words = [(.2, .44, 'abcdefghi'), (.44, .7, 'yes')]
         turns, _, coverage = align([dict(speaker='A', text='abcdefghi'),
@@ -111,6 +144,43 @@ class PlanningTests(unittest.TestCase):
                                 ({'segments': [{'words': [{'word': 'hi'}]}]}, r'words\[0\].*timestamps')]:
             with self.subTest(src=src), self.assertRaisesRegex(ValueError, diagnostic):
                 read_words(src, 1)
+
+    def test_nonblank_segment_without_usable_words_is_not_silently_dropped(self):
+        first = {'words': [{'start': 0, 'end': .1, 'word': 'Hi'}]}
+        last = {'words': [{'start': .3, 'end': .5, 'word': ' Bye'}]}
+        for fields in ({}, {'words': []}, {'words': [{'start': .1, 'end': .2, 'word': '  '}]}):
+            with self.subTest(fields=fields), self.assertRaisesRegex(ValueError, r'segments\[1\].*word timestamps'):
+                read_words({'segments': [first, dict(fields, text='Missing speech'), last]}, 1)
+        self.assertEqual(len(read_words({'segments': [first, {'text': '  '}, last]}, 1)), 2)
+
+    def test_raw_whisper_transcript_uses_system_temp_and_is_cleaned(self):
+        with tempfile.TemporaryDirectory() as temp:
+            checkout = Path(temp).resolve() / 'checkout'
+            run = checkout / 'custom-output'
+            checkout.mkdir()
+            docx(checkout/'script.docx', ['Script', 'A: Hi'])
+            for name in ('a.png', 'b.png', 'take.wav', 'model.pt'):
+                (checkout/name).touch()
+            expected = {'segments': [{'words': [{'start': 0, 'end': .5, 'word': 'Hi'}]}]}
+            locations = []
+
+            def fake_whisper(command):
+                raw_dir = Path(command[command.index('--output_dir') + 1]).resolve()
+                self.assertFalse(raw_dir.is_relative_to(checkout))
+                self.assertEqual(raw_dir.parent, Path(tempfile.gettempdir()).resolve())
+                locations.append(raw_dir)
+                (raw_dir/'take.json').write_text(json.dumps(expected))
+
+            args = ['--script', str(checkout/'script.docx'), '--section', 'Script',
+                    '--narration', str(checkout/'take.wav'), '--portrait-a', str(checkout/'a.png'),
+                    '--portrait-b', str(checkout/'b.png'), '--whisper-model', str(checkout/'model.pt'),
+                    '--plan-only', '--output', str(run)]
+            with patch('podcast_video_kit.__main__.command', side_effect=fake_whisper), \
+                    patch('podcast_video_kit.__main__.duration_wav', return_value=1):
+                self.assertEqual(main(args), 0)
+            self.assertFalse(locations[0].exists())
+            self.assertEqual(json.loads((run/'words.json').read_text()), expected)
+            self.assertEqual({p.name for p in run.iterdir()}, {'words.json', 'plan.json', 'captions.srt'})
 
     def test_zero_duration_word_fails_before_alignment_and_is_saved_for_retry(self):
         src = {'segments': [{'words': [{'start': .3, 'end': .3, 'word': 'hi'},
