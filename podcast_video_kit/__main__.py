@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_left
 from fractions import Fraction
 import hashlib
 import json
@@ -16,7 +17,8 @@ import wave
 from xml.etree.ElementTree import ParseError
 from zipfile import BadZipFile
 
-from .episode import align, captions, concept_scenes, read_words, script, srt
+from .episode import (IncompleteSegmentWords, align_with_provenance, captions,
+                      check_script_length, concept_scenes, read_words, script, srt)
 
 FPS = 24
 SIZE = (1280, 720)
@@ -101,10 +103,7 @@ def verify(video, aac, nframes, audio_seconds):
                 width=SIZE[0], height=SIZE[1], fps=FPS)
 
 
-def make_video(args, directory, config, turns, cues, scenes, duration):
-    import numpy as np
-    from .render import Renderer
-
+def _render_window(args, duration):
     # Index previews on the same frame grid, so caption and scene boundaries do not drift.
     total = math.ceil(duration * FPS)
     first = round(Fraction(str(args.preview_start)) * FPS) if args.preview else 0
@@ -112,13 +111,38 @@ def make_video(args, directory, config, turns, cues, scenes, duration):
     if first >= last:
         raise ValueError('Preview starts after the recording ends')
     offset = Fraction(first, FPS)
+    return first, last, offset, min(duration, Fraction(last, FPS))
+
+
+def _validate_cue_frames(cues, first, last, offset, end):
+    frames = range(first, last)
+    window_start, window_end = float(offset), float(end)
+    # Renderer.frame samples index / fps with start inclusive and end exclusive.
+    for i, cue in enumerate(cues, 1):
+        start = max(window_start, cue['start'])
+        stop = min(window_end, cue['end'])
+        if start >= stop:
+            continue
+        j = bisect_left(frames, start, key=lambda index: index / FPS)
+        if j == len(frames) or frames[j] / FPS >= stop:
+            raise ValueError(f'Caption cue {i} [{cue["start"]}, {cue["end"]}) seconds '
+                             f'has no visible frame at {FPS} fps in this render; '
+                             'adjust the word timings or preview bounds')
+
+
+def make_video(args, directory, config, turns, cues, scenes, duration):
+    first, last, offset, end = _render_window(args, duration)
+    _validate_cue_frames(cues, first, last, offset, end)
+    import numpy as np
+    from .render import Renderer
+
     start = float(offset)
-    length = float(min(duration-offset, Fraction(last-first, FPS)))
+    length = float(end-offset)
     font = args.font or Path(os.environ.get('PVK_FONT', str(MAC_FONT)))
     if not font.is_file():
         raise ValueError('Specify a local Korean-capable font with --font or PVK_FONT')
     renderer = Renderer(args.portrait_a, args.portrait_b, font,
-                        config.get('title', 'Podcast'), turns, cues, scenes)
+                        config.get('title', 'Podcast'), turns, cues, scenes, fps=FPS)
     audio = directory / 'audio.m4a'
     pcm = directory / 'analysis.wav'
     # Full mode never cuts, stretches, adds silence or resamples the delivery audio deliberately.
@@ -161,19 +185,27 @@ def build(args):
         if not file.is_file():
             raise ValueError(f'Input file not found: {file}')
     turns, notes = script(args.script, args.section)
+    check_script_length(turns)
     duration = duration_wav(args.narration)
-    if args.preview and Fraction(round(Fraction(str(args.preview_start))*FPS), FPS) >= duration:
-        raise ValueError('Preview starts after the recording ends')
+    if args.preview:
+        _render_window(args, duration)
     cfg = json.loads(args.config.read_text(encoding='utf-8')) if args.config else {}
     if not isinstance(cfg, dict) or not isinstance(cfg.get('title', 'Podcast'), str):
         raise ValueError('Config must be a JSON object with an optional text title')
     out = args.output.resolve()
     out.mkdir(mode=0o700, parents=True, exist_ok=False)
     transcript = transcribe(args)
+    try:
+        words = read_words(transcript, float(duration))
+    except IncompleteSegmentWords:
+        raise
+    except ValueError:
+        # Preserve the raw cache for retry after existing timing/structure errors.
+        json_write(out / 'words.json', transcript)
+        raise
     json_write(out / 'words.json', transcript)
-    words = read_words(transcript, float(duration))
-    aligned, weak, coverage = align(turns, words)
-    cues = captions(aligned, words)
+    aligned, weak, coverage, token_matches = align_with_provenance(turns, words)
+    cues = captions(aligned, words, token_matches)
     scenes = concept_scenes(cfg, aligned)
     json_write(out / 'plan.json', dict(duration=float(duration), script_character_coverage=coverage,
                low_coverage_turns=weak, turns=aligned, unlabeled_paragraphs=notes,

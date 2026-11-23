@@ -1,33 +1,87 @@
 import contextlib
+from fractions import Fraction
 import io
 import json
 import math
 from pathlib import Path
 import shutil
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import wave
 from xml.sax.saxutils import escape
 from zipfile import ZipFile
 
-from podcast_video_kit.__main__ import duration_wav, main
-from podcast_video_kit.episode import align, captions, concept_scenes, read_words, script, srt
+from podcast_video_kit.__main__ import _render_window, _validate_cue_frames, duration_wav, main
+from podcast_video_kit.episode import align, align_with_provenance, captions, concept_scenes, read_words, script, srt
 
 
 NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
 
 
-def docx(path, rows, styles=''):
+def docx(path, rows, styles='', numbering=''):
     paragraphs = [(row, '') if isinstance(row, str) else row for row in rows]
     xml = ''.join(f'<w:p>{props}<w:r><w:t>{escape(row)}</w:t></w:r></w:p>' for row, props in paragraphs)
     with ZipFile(path, 'w') as z:
         z.writestr('word/document.xml', f'<w:document xmlns:w="{NS}"><w:body>{xml}</w:body></w:document>')
         if styles:
             z.writestr('word/styles.xml', f'<w:styles xmlns:w="{NS}">{styles}</w:styles>')
+        if numbering:
+            z.writestr('word/numbering.xml', f'<w:numbering xmlns:w="{NS}">{numbering}</w:numbering>')
+
+
+def number_props(num_id=3, level=0):
+    return (f'<w:pPr><w:numPr><w:ilvl w:val="{level}"/>'
+            f'<w:numId w:val="{num_id}"/></w:numPr></w:pPr>')
+
+
+def cli_fixture(root, rows):
+    docx(root/'script.docx', rows)
+    for name in ('a.png', 'b.png', 'narration.wav'):
+        (root/name).touch()
+    return ['--script', str(root/'script.docx'), '--section', 'Script',
+            '--narration', str(root/'narration.wav'), '--portrait-a', str(root/'a.png'),
+            '--portrait-b', str(root/'b.png')]
 
 
 class PlanningTests(unittest.TestCase):
+    def test_automatic_decimal_sections_and_numbered_dialogue(self):
+        numbering = '''<w:abstractNum w:abstractNumId="2"><w:lvl w:ilvl="0">
+                         <w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/>
+                       </w:lvl></w:abstractNum>
+                       <w:num w:numId="3"><w:abstractNumId w:val="2"/><w:lvlOverride w:ilvl="0">
+                         <w:startOverride w:val="7"/>
+                       </w:lvlOverride></w:num>'''
+        with tempfile.TemporaryDirectory() as temp:
+            p = Path(temp) / 'example.docx'
+            docx(p, [('Script', number_props()), ('A: First', number_props(4)),
+                     ('Nested note', number_props(level=1)), 'B: Second',
+                     ('Appendix', number_props()), 'A: Outside'], numbering=numbering)
+            for heading in ('7. Script', 'Script'):
+                with self.subTest(heading=heading):
+                    turns, notes = script(p, heading)
+                    self.assertEqual([t['text'] for t in turns], ['First', 'Second'])
+                    self.assertEqual(notes, [dict(paragraph=3, after_turn=1, text='Nested note')])
+            with self.assertRaisesRegex(ValueError, 'exact heading'):
+                script(p, '8. Script')
+
+    def test_unsupported_automatic_sections_fail_at_selection_or_boundary(self):
+        roman = '''<w:abstractNum w:abstractNumId="2"><w:lvl w:ilvl="0">
+                     <w:start w:val="7"/><w:numFmt w:val="upperRoman"/><w:lvlText w:val="%1."/>
+                   </w:lvl></w:abstractNum>
+                   <w:num w:numId="3"><w:abstractNumId w:val="2"/></w:num>'''
+        with tempfile.TemporaryDirectory() as temp:
+            p = Path(temp) / 'example.docx'
+            docx(p, [('Script', number_props()), 'A: Inside', ('Appendix', number_props()), 'B: Outside'])
+            for heading in ('7. Script', 'Script'):
+                with self.subTest(heading=heading), self.assertRaisesRegex(ValueError, 'Paragraph 1: automatic numbering'):
+                    script(p, heading)
+            docx(p, ['Script', ('A: Inside', number_props(4)), ('Appendix', number_props()), 'B: Outside'],
+                 numbering=roman)
+            with self.assertRaisesRegex(ValueError, 'Paragraph 3: automatic numbering'):
+                script(p, 'Script')
+
     def test_decimal_note_does_not_truncate_dialogue(self):
         with tempfile.TemporaryDirectory() as temp:
             p = Path(temp) / 'example.docx'
@@ -35,6 +89,41 @@ class PlanningTests(unittest.TestCase):
             turns, notes = script(p, '7. Script')
             self.assertEqual([t['text'] for t in turns], ['First', 'Second'])
             self.assertEqual([n['text'] for n in notes], ['8.5% growth'])
+
+    def test_top_level_bullets_stay_in_the_script_section(self):
+        bullet = '<w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/><w:lvlText w:val="•"/></w:lvl>'
+        decimal = ('<w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/>'
+                   '<w:lvlText w:val="%1."/></w:lvl>')
+        override = '<w:lvlOverride w:ilvl="0">{}</w:lvlOverride>'
+        numbering = f'''<w:abstractNum w:abstractNumId="1">{bullet}</w:abstractNum>
+                        <w:abstractNum w:abstractNumId="2">{decimal}</w:abstractNum>
+                        <w:num w:numId="3"><w:abstractNumId w:val="1"/></w:num>
+                        <w:num w:numId="4"><w:abstractNumId w:val="2"/>{override.format(bullet)}</w:num>
+                        <w:num w:numId="5"><w:abstractNumId w:val="1"/>{override.format(decimal)}</w:num>'''
+        with tempfile.TemporaryDirectory() as temp:
+            p = Path(temp) / 'example.docx'
+            rows = ['7. Script', 'A: First', ('8. Note', number_props()),
+                    ('Another note', number_props(4)), ('B: Second', number_props(4)),
+                    '8. Appendix', 'A: Outside']
+            docx(p, rows, numbering=numbering)
+            turns, notes = script(p, '7. Script')
+            self.assertEqual(turns, [dict(speaker='A', text='First', paragraph=2),
+                                     dict(speaker='B', text='Second', paragraph=5)])
+            self.assertEqual(notes, [dict(paragraph=3, after_turn=1, text='8. Note'),
+                                     dict(paragraph=4, after_turn=1, text='Another note')])
+
+            for props in (number_props(5), number_props(level='')):
+                with self.subTest(props=props):
+                    rows[2] = ('Ambiguous list item', props)
+                    docx(p, rows, numbering=numbering)
+                    with self.assertRaisesRegex(ValueError, 'Paragraph 3: automatic numbering'):
+                        script(p, '7. Script')
+
+            outline = '<w:outlineLvl w:val="0"/>'
+            rows[0] = ('7. Script', f'<w:pPr>{outline}</w:pPr>')
+            rows[2] = ('Outline heading', number_props().replace('</w:pPr>', f'{outline}</w:pPr>'))
+            docx(p, rows, numbering=numbering)
+            self.assertEqual(script(p, '7. Script'), ([turns[0]], []))
 
     def test_exact_heading_preserves_punctuation_and_case(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -106,15 +195,27 @@ class PlanningTests(unittest.TestCase):
         words = [(0, 1, 'anymore'), (1, 1.5, ' later')]
         for second_speaker, expected in [('B', ''), ('A', 'A')]:
             with self.subTest(second_speaker=second_speaker):
-                turns, _, coverage = align([dict(speaker='A', text='any'),
-                                            dict(speaker=second_speaker, text='more later')], words)
+                turns, _, coverage, provenance = align_with_provenance(
+                    [dict(speaker='A', text='any'), dict(speaker=second_speaker, text='more later')], words)
                 self.assertEqual(coverage, 1)
-                cues = captions(turns, words)
+                self.assertEqual(turns[0]['end'], turns[1]['start'])
+                cues = captions(turns, words, provenance)
                 self.assertEqual(cues[0]['speaker'], expected)
                 if not expected:
                     self.assertEqual(cues[0], dict(start=0, end=1, text='anymore', speaker=''))
                     self.assertEqual(cues[1]['speaker'], 'B')
                     self.assertIn('\nanymore\n\n', srt(cues))
+                else:
+                    self.assertEqual(cues, [dict(start=0, end=1.5, text='anymore later', speaker='A')])
+
+    def test_unmatched_token_between_same_speaker_anchors_is_unattributed(self):
+        words = [(.1, .4, 'Red'), (.4, .7, ' why'), (.7, 1, ' blue')]
+        turns, _, coverage, provenance = align_with_provenance([dict(speaker='A', text='red blue')], words)
+        self.assertEqual(coverage, 1)
+        self.assertEqual(provenance, [3, 0, 4])
+        self.assertEqual(captions(turns, words, provenance),
+                         [dict(start=a, end=b, text=text.strip(), speaker=speaker)
+                          for (a, b, text), speaker in zip(words, ('A', '', 'A'))])
 
     def test_alignment_uses_exact_word_endpoints(self):
         words = [(.2, .44, 'abcdefghi'), (.44, .7, 'yes')]
@@ -152,6 +253,58 @@ class PlanningTests(unittest.TestCase):
             with self.subTest(fields=fields), self.assertRaisesRegex(ValueError, r'segments\[1\].*word timestamps'):
                 read_words({'segments': [first, dict(fields, text='Missing speech'), last]}, 1)
         self.assertEqual(len(read_words({'segments': [first, {'text': '  '}, last]}, 1)), 2)
+
+    def test_segment_text_must_match_timed_words_before_any_outputs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            args = cli_fixture(root, ['Script', 'A: Red'])
+            cache = root/'input.json'
+            words = [{'start': .1, 'end': .4, 'word': 'Red'}]
+            with patch('podcast_video_kit.__main__.duration_wav', return_value=1):
+                cache.write_text(json.dumps({'segments': [{'text': 'Red blue', 'words': words}]}))
+                with contextlib.redirect_stderr(io.StringIO()) as error:
+                    self.assertEqual(main(args + ['--words-json', str(cache), '--plan-only',
+                                                  '--output', str(root/'bad')]), 1)
+                self.assertRegex(error.getvalue(), r'segments\[0\]\.text does not match its timed words')
+                self.assertFalse(list((root/'bad').iterdir()))
+                words += [{'start': .4, 'end': .7, 'word': ' why'}, {'start': .7, 'end': 1, 'word': ' blue'}]
+                docx(root/'script.docx', ['Script', 'A: Red blue'])
+                cache.write_text(json.dumps({'segments': [{'text': '  ＲＥＤ, WHY! Blue.', 'words': words}]}))
+                self.assertEqual(main(args + ['--words-json', str(cache), '--plan-only',
+                                              '--output', str(root/'valid')]), 0)
+            plan = json.loads((root/'valid'/'plan.json').read_text())
+            self.assertEqual(plan['turns'], [dict(speaker='A', text='Red blue', paragraph=2,
+                                                 coverage=1, start=.1, end=1)])
+            self.assertEqual(plan['captions'][1], dict(start=.4, end=.7, text='why', speaker=''))
+            self.assertIn('\nwhy\n\n', (root/'valid'/'captions.srt').read_text())
+
+    def test_long_script_is_rejected_before_whisper_in_plan_and_preview(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            args = cli_fixture(root, ['Script', 'A: ' + 'ß ' * 15_000, 'B: !x'])
+            model = root/'model.pt'
+            model.touch()
+            with patch('podcast_video_kit.__main__.command') as command:
+                for mode in (['--plan-only'], ['--preview', '1']):
+                    with self.subTest(mode=mode), contextlib.redirect_stderr(io.StringIO()) as error:
+                        self.assertEqual(main(args + ['--whisper-model', str(model),
+                                                      '--output', str(root/'run')] + mode), 1)
+                        self.assertIn('30,000 normalized characters', error.getvalue())
+                command.assert_not_called()
+            self.assertFalse((root/'run').exists())
+        with self.assertRaisesRegex(ValueError, '30,000 normalized characters'):
+            align([dict(speaker='A', text='red')], [(0, 1, 'red' * 10_001)])
+
+    def test_preview_frame_validation_uses_clipped_half_open_cues(self):
+        args = SimpleNamespace(preview_start=1, preview=.04)
+        window = _render_window(args, 2)
+        visible = dict(start=.99, end=1.01)
+        invisible = dict(start=1.01, end=1.05)
+        outside = dict(start=1.05, end=1.06)
+        with self.assertRaisesRegex(ValueError, r'Caption cue 2 \[1\.01, 1\.05\)'):
+            _validate_cue_frames([visible, invisible, outside], *window)
+        _validate_cue_frames([dict(start=.98, end=1), visible, outside], *window)
+        _validate_cue_frames([dict(start=1.021, end=1.04)], *_render_window(args, Fraction(51, 50)))
 
     def test_raw_whisper_transcript_uses_system_temp_and_is_cleaned(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -219,6 +372,29 @@ FONT = next((x for x in FONT_CANDIDATES if Path(x).is_file()), None)
 
 @unittest.skipUnless(FONT and shutil.which('ffmpeg') and shutil.which('ffprobe'), 'Needs ffmpeg and a local font')
 class MediaSmokeTest(unittest.TestCase):
+    def test_cue_between_frames_fails_full_render_but_outside_preview_renders(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = cli_fixture(root, ['Script', 'A: Red', 'B: blue'])
+            with wave.open(str(root/'narration.wav'), 'wb') as wav:
+                wav.setparams((1, 2, 24_000, 0, 'NONE', 'not compressed'))
+                wav.writeframes(b'\x01\x00' * 30_000)
+            for name in ('a', 'b'):
+                Image.new('RGB', (100, 100), 'green').save(root/f'{name}.png')
+            cache = root/'input.json'
+            cache.write_text(json.dumps({'segments': [{'text': 'Red blue', 'words': [
+                dict(start=.9, end=1.01, word='Red'), dict(start=1.01, end=1.03, word=' blue')
+            ]}]}))
+            args += ['--words-json', str(cache), '--font', FONT]
+            with contextlib.redirect_stderr(io.StringIO()) as error:
+                self.assertEqual(main(args + ['--output', str(root/'full')]), 1)
+            self.assertRegex(error.getvalue(), r'Caption cue 2 \[1\.01, 1\.03\).*24 fps')
+            self.assertFalse((root/'full'/'audio.m4a').exists())
+            self.assertEqual(main(args + ['--output', str(root/'preview'), '--preview-start', '.875',
+                                         '--preview', '.125']), 0)
+            self.assertTrue((root/'preview'/'preview.mp4').is_file())
+
     def test_exact_sample_duration_and_touching_turns_render(self):
         from PIL import Image
         with tempfile.TemporaryDirectory() as directory:
