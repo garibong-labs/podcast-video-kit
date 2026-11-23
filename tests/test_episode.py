@@ -3,6 +3,7 @@ from fractions import Fraction
 import io
 import json
 import math
+import os
 from pathlib import Path
 import shutil
 import tempfile
@@ -124,6 +125,42 @@ class PlanningTests(unittest.TestCase):
             rows[2] = ('Outline heading', number_props().replace('</w:pPr>', f'{outline}</w:pPr>'))
             docx(p, rows, numbering=numbering)
             self.assertEqual(script(p, '7. Script'), ([turns[0]], []))
+
+    def test_style_inherited_bullets_require_a_unique_effective_level_link(self):
+        styles = '''<w:style w:type="paragraph" w:styleId="BulletParent">
+                      <w:pPr><w:numPr><w:ilvl w:val="2"/><w:numId w:val="3"/></w:numPr></w:pPr>
+                    </w:style>
+                    <w:style w:type="paragraph" w:styleId="BulletChild">
+                      <w:basedOn w:val="BulletParent"/>
+                    </w:style>'''
+        bullet = '<w:lvl w:ilvl="{}"><w:numFmt w:val="bullet"/>{}</w:lvl>'
+        parent = '<w:pStyle w:val="BulletParent"/>'
+        numbering = '''<w:abstractNum w:abstractNumId="2">{}</w:abstractNum>
+                       <w:num w:numId="3"><w:abstractNumId w:val="2"/>{}</w:num>'''
+        props = '<w:pPr><w:pStyle w:val="BulletChild"/></w:pPr>'
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'example.docx'
+            rows = ['7. Script', 'A: First', ('8. Bullet note', props), ('B: Second', props),
+                    '8. Appendix', 'A: Outside']
+            override = f'<w:lvlOverride w:ilvl="0">{bullet.format(0, parent)}</w:lvlOverride>'
+            for levels, effective_override in ((bullet.format(0, parent), ''),
+                                               (bullet.format(0, ''), override)):
+                docx(path, rows, styles, numbering.format(levels, effective_override))
+                turns, notes = script(path, '7. Script')
+                self.assertEqual([t['text'] for t in turns], ['First', 'Second'])
+                self.assertEqual([n['text'] for n in notes], ['8. Bullet note'])
+
+            rows[2] = ('Bullet note', props)
+            without_link = f'<w:lvlOverride w:ilvl="0">{bullet.format(0, "")}</w:lvlOverride>'
+            for levels, effective_override in (
+                (bullet.format(0, ''), ''),
+                (bullet.format(0, parent) + bullet.format(1, parent), ''),
+                (bullet.format(0, parent), without_link),
+            ):
+                with self.subTest(levels=levels, override=effective_override):
+                    docx(path, rows, styles, numbering.format(levels, effective_override))
+                    with self.assertRaisesRegex(ValueError, 'Paragraph 3: automatic numbering'):
+                        script(path, '7. Script')
 
     def test_exact_heading_preserves_punctuation_and_case(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -254,19 +291,34 @@ class PlanningTests(unittest.TestCase):
                 read_words({'segments': [first, dict(fields, text='Missing speech'), last]}, 1)
         self.assertEqual(len(read_words({'segments': [first, {'text': '  '}, last]}, 1)), 2)
 
-    def test_segment_text_must_match_timed_words_before_any_outputs(self):
+    def test_segment_mismatch_only_preserves_the_verbatim_generated_cache(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             args = cli_fixture(root, ['Script', 'A: Red'])
             cache = root/'input.json'
+            model = root/'model.pt'
+            model.touch()
             words = [{'start': .1, 'end': .4, 'word': 'Red'}]
+            raw = (json.dumps({'segments': [{'text': 'Red blue', 'words': words}]}) + '\r\n').encode()
+
+            def fake_whisper(command):
+                raw_dir = Path(command[command.index('--output_dir') + 1])
+                (raw_dir/'narration.json').write_bytes(raw)
+
             with patch('podcast_video_kit.__main__.duration_wav', return_value=1):
-                cache.write_text(json.dumps({'segments': [{'text': 'Red blue', 'words': words}]}))
-                with contextlib.redirect_stderr(io.StringIO()) as error:
-                    self.assertEqual(main(args + ['--words-json', str(cache), '--plan-only',
-                                                  '--output', str(root/'bad')]), 1)
-                self.assertRegex(error.getvalue(), r'segments\[0\]\.text does not match its timed words')
-                self.assertFalse(list((root/'bad').iterdir()))
+                cache.write_bytes(raw)
+                with patch('podcast_video_kit.__main__.command', side_effect=fake_whisper) as command:
+                    for flag, source, directory in (('--words-json', cache, 'imported'),
+                                                    ('--whisper-model', model, 'generated')):
+                        with contextlib.redirect_stderr(io.StringIO()) as error:
+                            self.assertEqual(main(args + [flag, str(source), '--plan-only',
+                                                          '--output', str(root/directory)]), 1)
+                        self.assertRegex(error.getvalue(), r'segments\[0\]\.text does not match its timed words')
+                    command.assert_called_once()
+                self.assertEqual(cache.read_bytes(), raw)
+                self.assertFalse(list((root/'imported').iterdir()))
+                self.assertEqual({p.name for p in (root/'generated').iterdir()}, {'words.json'})
+                self.assertEqual((root/'generated'/'words.json').read_bytes(), raw)
                 words += [{'start': .4, 'end': .7, 'word': ' why'}, {'start': .7, 'end': 1, 'word': ' blue'}]
                 docx(root/'script.docx', ['Script', 'A: Red blue'])
                 cache.write_text(json.dumps({'segments': [{'text': '  ＲＥＤ, WHY! Blue.', 'words': words}]}))
@@ -277,6 +329,44 @@ class PlanningTests(unittest.TestCase):
                                                  coverage=1, start=.1, end=1)])
             self.assertEqual(plan['captions'][1], dict(start=.4, end=.7, text='why', speaker=''))
             self.assertIn('\nwhy\n\n', (root/'valid'/'captions.srt').read_text())
+
+    def test_missing_or_corrupt_selected_font_fails_before_whisper_except_plan_only(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            args = cli_fixture(root, ['Script', 'A: Red'])
+            model, missing, corrupt = (root/name for name in ('model.pt', 'missing.ttf', 'corrupt.ttf'))
+            model.touch()
+            corrupt.write_bytes(b'not a font')
+            args += ['--whisper-model', str(model)]
+
+            def fake_whisper(command):
+                raw_dir = Path(command[command.index('--output_dir') + 1])
+                (raw_dir/'narration.json').write_text(
+                    json.dumps({'segments': [{'words': [dict(start=0, end=1, word='Red')]}]}))
+
+            with patch('podcast_video_kit.__main__.duration_wav', return_value=1), \
+                    patch('podcast_video_kit.__main__.command') as command, \
+                    patch.dict(os.environ, PVK_FONT=str(corrupt)):
+                for font_args, mode, message, path in (
+                    (['--font', str(missing)], [], 'Font file not found', missing),
+                    ([], ['--preview', '1'], 'Cannot load font', corrupt),
+                ):
+                    with contextlib.redirect_stderr(io.StringIO()) as error:
+                        self.assertEqual(main(args + font_args + mode + ['--output', str(root/'render')]), 1)
+                    self.assertIn(message, error.getvalue())
+                    self.assertIn(str(path), error.getvalue())
+                self.assertFalse((root/'render').exists())
+                del os.environ['PVK_FONT']
+                with patch('podcast_video_kit.__main__.MAC_FONT', corrupt), \
+                        contextlib.redirect_stderr(io.StringIO()) as error:
+                    self.assertEqual(main(args + ['--output', str(root/'default')]), 1)
+                    self.assertIn(f'Cannot load font {corrupt}', error.getvalue())
+                command.assert_not_called()
+                command.side_effect = fake_whisper
+                for path in (missing, corrupt):
+                    out = root/path.stem
+                    self.assertEqual(main(args + ['--font', str(path), '--plan-only', '--output', str(out)]), 0)
+                    self.assertTrue((out/'plan.json').is_file())
 
     def test_long_script_is_rejected_before_whisper_in_plan_and_preview(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -305,6 +395,52 @@ class PlanningTests(unittest.TestCase):
             _validate_cue_frames([visible, invisible, outside], *window)
         _validate_cue_frames([dict(start=.98, end=1), visible, outside], *window)
         _validate_cue_frames([dict(start=1.021, end=1.04)], *_render_window(args, Fraction(51, 50)))
+
+    def test_unmatched_lexical_intervals_neutralize_only_their_own_frames(self):
+        from PIL import Image, ImageChops, ImageFont
+        from podcast_video_kit.render import Renderer
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            args = cli_fixture(root, ['Script', 'A: Red blue'])
+            for name, color in (('a', 'red'), ('b', 'green')):
+                Image.new('RGB', (60, 80), color).save(root/f'{name}.png')
+            font_path = root/'font.ttf'
+            font_path.write_bytes(ImageFont.load_default(size=36).font_bytes)
+            cache = root/'input.json'
+            cache.write_text(json.dumps({'segments': [{'words': [
+                dict(start=0, end=.5, word='Red'), dict(start=.5, end=.75, word='!'),
+                dict(start=.75, end=1, word=' xx'), dict(start=1.25, end=1.5, word=' yy'),
+                dict(start=1.5, end=2, word=' blue'),
+            ]}]}))
+
+            def check_frames(options, directory, config, turns, cues, scenes, duration, font, unmatched_words):
+                portraits = (options.portrait_a, options.portrait_b, font, 'Podcast')
+                actual = Renderer(*portraits, turns, cues, scenes, unmatched_words=unmatched_words)
+                neutral = Renderer(*portraits, [], cues, scenes)
+                live = Renderer(*portraits, turns, cues, scenes)
+                for index in range(17, 37):
+                    with self.subTest(frame=index):
+                        frame = actual.frame(index, .8)
+                        unknown = index in range(18, 24) or index in range(30, 36)
+                        expected = (neutral if unknown else live).frame(index, .8)
+                        self.assertEqual(frame.mode, 'RGB')
+                        self.assertIsNone(ImageChops.difference(frame, expected).getbbox())
+                        # Close-up A meter at this time, or the idle wide layout.
+                        self.assertEqual(frame.getpixel((1130, 499)) == (255, 203, 129), not unknown)
+                return dict(mode='full', frames=48)
+
+            out = root/'render'
+            with patch('podcast_video_kit.__main__.duration_wav', return_value=2), \
+                    patch('podcast_video_kit.__main__.make_video', side_effect=check_frames):
+                self.assertEqual(main(args + ['--words-json', str(cache), '--font', str(font_path),
+                                              '--output', str(out)]), 0)
+            plan = json.loads((out/'plan.json').read_text())
+            self.assertEqual(plan['turns'], [dict(speaker='A', text='Red blue', paragraph=2,
+                                                 start=0, end=2, coverage=1)])
+            self.assertEqual(plan['captions'], [dict(start=0, end=.75, speaker='A', text='Red!'),
+                                               dict(start=.75, end=1.5, speaker='', text='xx yy'),
+                                               dict(start=1.5, end=2, speaker='A', text='blue')])
 
     def test_raw_whisper_transcript_uses_system_temp_and_is_cleaned(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -335,7 +471,7 @@ class PlanningTests(unittest.TestCase):
             self.assertEqual(json.loads((run/'words.json').read_text()), expected)
             self.assertEqual({p.name for p in run.iterdir()}, {'words.json', 'plan.json', 'captions.srt'})
 
-    def test_zero_duration_word_fails_before_alignment_and_is_saved_for_retry(self):
+    def test_zero_duration_imported_word_fails_before_alignment_without_copying(self):
         src = {'segments': [{'words': [{'start': .3, 'end': .3, 'word': 'hi'},
                                       {'start': .3, 'end': .5, 'word': ' yes'}]}]}
         with tempfile.TemporaryDirectory() as temp:
@@ -352,8 +488,8 @@ class PlanningTests(unittest.TestCase):
                     contextlib.redirect_stderr(io.StringIO()) as error:
                 self.assertEqual(main(args), 1)
             self.assertRegex(error.getvalue(), r'segments\[0\]\.words\[0\] has no positive duration')
-            self.assertEqual(json.loads((p/'run/words.json').read_text()), src)
-            self.assertFalse((p/'run/plan.json').exists())
+            self.assertEqual(json.loads((p/'input.json').read_text()), src)
+            self.assertFalse(list((p/'run').iterdir()))
 
     def test_concepts_preserve_explicit_body_and_reject_overlap(self):
         turns = [dict(start=0, end=3), dict(start=3.5, end=5)]
@@ -364,6 +500,13 @@ class PlanningTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 concept_scenes(dict(scenes=scenes), turns)
 
+    def test_concept_duration_allows_only_roundoff_below_two_seconds(self):
+        config = dict(scenes=[dict(first_turn=1, title='Example', body='Details')])
+        self.assertEqual(concept_scenes(config, [dict(start=.30, end=2.30)]),
+                         [dict(start=.30, end=2.30, title='Example', body='Details')])
+        with self.assertRaisesRegex(ValueError, 'at least 2 seconds'):
+            concept_scenes(config, [dict(start=.30, end=2.299999999)])
+
 
 FONT_CANDIDATES = ['/System/Library/Fonts/AppleSDGothicNeo.ttc',
                    '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf']
@@ -372,6 +515,37 @@ FONT = next((x for x in FONT_CANDIDATES if Path(x).is_file()), None)
 
 @unittest.skipUnless(FONT and shutil.which('ffmpeg') and shutil.which('ffprobe'), 'Needs ffmpeg and a local font')
 class MediaSmokeTest(unittest.TestCase):
+    def test_preview_passes_with_an_oversized_card_outside_its_window(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            args = cli_fixture(root, ['Script', 'A: Red', 'B: blue'])
+            with wave.open(str(root/'narration.wav'), 'wb') as wav:
+                wav.setparams((1, 2, 24_000, 0, 'NONE', 'not compressed'))
+                wav.writeframes(b'\x01\x00' * 96_000)
+            for name in ('a', 'b'):
+                Image.new('RGB', (60, 80), 'green').save(root/f'{name}.png')
+            cache, config = root/'input.json', root/'config.json'
+            cache.write_text(json.dumps({'segments': [{'words': [
+                dict(start=0, end=2, word='Red'), dict(start=2, end=4, word=' blue'),
+            ]}]}))
+            config.write_text(json.dumps({'scenes': [
+                dict(first_turn=1, title='First', body='line\n' * 40),
+                dict(first_turn=2, title='Second', body='This fits'),
+            ]}))
+            args += ['--words-json', str(cache), '--font', FONT, '--config', str(config), '--preview', '.125']
+            outside, inside = root/'outside', root/'inside'
+            self.assertEqual(main(args + ['--output', str(outside), '--preview-start', '2']), 0)
+            self.assertTrue((outside/'preview.mp4').is_file())
+            with contextlib.redirect_stderr(io.StringIO()) as error:
+                self.assertEqual(main(args + ['--output', str(inside)]), 1)
+            self.assertIn('scene body at 0s does not fit', error.getvalue())
+            for name in ('plan.json', 'captions.srt'):
+                self.assertEqual((outside/name).read_bytes(), (inside/name).read_bytes())
+            plan = json.loads((outside/'plan.json').read_text())
+            self.assertEqual([(s['start'], s['end']) for s in plan['scenes']], [(0, 2), (2, 4)])
+            self.assertIn('00:00:02,000 --> 00:00:04,000', (outside/'captions.srt').read_text())
+
     def test_cue_between_frames_fails_full_render_but_outside_preview_renders(self):
         from PIL import Image
         with tempfile.TemporaryDirectory() as directory:

@@ -70,23 +70,27 @@ def _outline(node, style_id, inherited, default_outline):
     return OUTLINE_LEVELS.get(default_outline)
 
 
-def _top_level_numbering(root):
+def _numbering(root):
     abstracts = {abstract_id: node for node in root.findall(W + 'abstractNum')
                  if (abstract_id := node.get(W + 'abstractNumId'))}
-    decimals, bullets = {}, set()
+    decimals, bullets, style_levels = {}, set(), {}
     for num in root.findall(W + 'num'):
         num_id = num.get(W + 'numId')
         abstract = abstracts.get(_property(num, 'abstractNumId'))
         if not num_id or abstract is None or abstract.find(W + 'numStyleLink') is not None:
             continue
-        level = abstract.find(f'{W}lvl[@{W}ilvl="0"]')
-        override = num.find(f'{W}lvlOverride[@{W}ilvl="0"]')
+        levels = {node.get(W + 'ilvl'): node for node in abstract.findall(W + 'lvl')}
         start_override = None
-        if override is not None:
-            start_override = _property(override, 'startOverride')
+        for override in num.findall(W + 'lvlOverride'):
+            index = override.get(W + 'ilvl')
+            if index == '0':
+                start_override = _property(override, 'startOverride')
             replacement = override.find(W + 'lvl')
             if replacement is not None:
-                level = replacement
+                levels[index] = replacement
+        style_levels[num_id] = [(index, style) for index, node in levels.items()
+                                if index in OUTLINE_LEVELS and (style := _property(node, 'pStyle'))]
+        level = levels.get('0')
         if level is None:
             continue
         num_fmt = _property(level, 'numFmt')
@@ -98,10 +102,10 @@ def _top_level_numbering(root):
         start = start_override if start_override is not None else _property(level, 'start')
         if label in ('%1.', '%1)') and start is not None and re.fullmatch(r'[0-9]{1,9}', start):
             decimals[num_id] = int(start), label[-1]
-    return decimals, bullets
+    return decimals, bullets, style_levels
 
 
-def _automatic_number(node, inherited):
+def _automatic_number(node, inherited, style_levels):
     direct = node.find(f'{W}pPr/{W}numPr')
     num_id = _property(node, 'pPr/numPr/numId')
     if num_id == '0':
@@ -112,7 +116,12 @@ def _automatic_number(node, inherited):
     for style in inherited:
         style_num = _property(style, 'pPr/numPr/numId')
         if style_num is not None:
-            return (None, None) if style_num == '0' else (style_num, None)
+            if style_num == '0':
+                return None, None
+            # Style numbering takes its level from the effective list's pStyle links.
+            style_ids = {p.get(W + 'styleId') for p in inherited}
+            linked = [index for index, sid in style_levels.get(style_num, ()) if sid in style_ids]
+            return style_num, linked[0] if len(linked) == 1 else None
     return ('', None) if direct is not None else (None, None)
 
 
@@ -129,9 +138,9 @@ def script(path, heading):
         except KeyError:  # Some exporters omit styles.xml entirely.
             styles_xml = ET.Element(W + 'styles')
         try:
-            decimals, bullets = _top_level_numbering(_word_xml(z, 'numbering.xml'))
+            decimals, bullets, style_levels = _numbering(_word_xml(z, 'numbering.xml'))
         except KeyError:
-            decimals, bullets = {}, set()
+            decimals, bullets, style_levels = {}, set(), {}
     if body is None:
         raise ValueError('DOCX has no document body')
     styles = {s.get(W + 'styleId'): s for s in styles_xml.findall(W + 'style')
@@ -149,7 +158,8 @@ def script(path, heading):
         inherited = tuple(_style_chain(style_id, styles))
         outline = _outline(node, style_id, inherited, default_outline)
         num_id, list_level = _automatic_number(
-            node, inherited if default_paragraph is None else (*inherited, default_paragraph))
+            node, inherited if default_paragraph is None else (*inherited, default_paragraph),
+            style_levels)
         label = None
         if num_id in decimals and list_level not in OUTLINE_LEVELS:
             # An unresolved level may have advanced this list's top-level counter.
@@ -347,7 +357,8 @@ def concept_scenes(config, turns):
         if not isinstance(title, str) or not title.strip() or not isinstance(body, str) or not body.strip():
             raise ValueError('Concept scenes require a nonempty title and body')
         start, end = turns[i-1]['start'], turns[j-1]['end']
-        if end-start < 2:
+        seconds = end - start
+        if seconds < 2 and not math.isclose(seconds, 2, rel_tol=0, abs_tol=1e-12):
             raise ValueError('Choose at least 2 seconds of dialogue for each concept scene')
         result.append(dict(start=start, end=end, title=title, body=body))
     result.sort(key=lambda item: item['start'])

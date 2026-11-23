@@ -12,6 +12,9 @@ and cues use logical speaker ``A`` or ``B``; cues include ``text`` and may use
 multiline ``body``, and optional ``kind`` (a literal label, not a template
 selector). No values are calculated and no content is inferred.
 Captions follow their own timeline, including across scene cuts and silence.
+Pass exact unmatched-word intervals as ``unmatched_words`` to use the neutral
+studio shot during those intervals. An optional ``frame_window`` of absolute
+frame indices limits text layout and frame requests to that window.
 
 Portraits are EXIF-oriented, contain-fitted without cropping visible pixels,
 and composited with alpha over colored mattes. Only the first image of an
@@ -28,8 +31,8 @@ instead of clipping or dropping text. Split dense cues or cards upstream.
 
 from __future__ import annotations
 
-from bisect import bisect_right
-from collections.abc import Iterator
+from bisect import bisect_left, bisect_right
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 import math
 import operator
@@ -45,6 +48,7 @@ _SILENCE_RMS = 0.008  # Linear full-scale PCM, about -42 dBFS.
 _CONCEPT_TITLE_Y = 183
 _CONCEPT_BODY_GAP = 25
 _CONCEPT_TEXT_BOTTOM = 505
+_TITLE_FONT_SIZE = 36
 _INK = "#17262d"
 _PAPER = "#f6efe1"
 _LIGHT = "#f8f2e6"
@@ -63,7 +67,7 @@ class _Timeline:
     rows: tuple[dict, ...]
 
     @classmethod
-    def build(cls, name: str, entries: list[dict]) -> _Timeline:
+    def build(cls, name: str, entries: Iterable[dict]) -> _Timeline:
         intervals = []
         for i, item in enumerate(entries):
             try:
@@ -93,6 +97,26 @@ class _Timeline:
     def at(self, time: float) -> int:
         i = bisect_right(self.starts, time) - 1
         return i if i >= 0 and time < self.ends[i] else -1
+
+    def visible(self, frames: range, fps: float) -> Iterator[tuple[int, float]]:
+        """Yield each sampled row's original index and its last sampled time."""
+        def time(index: int) -> float:
+            return index / fps
+
+        for i, (start, end) in enumerate(zip(self.starts, self.ends)):
+            stop = bisect_left(frames, end, key=time)
+            if stop and (sample := time(frames[stop - 1])) >= start:
+                yield i, sample
+
+
+def load_font(path: Path, size: int = _TITLE_FONT_SIZE) -> ImageFont.FreeTypeFont:
+    if not Path(path).is_file():
+        raise ValueError(f"Font file not found: {path}; use --font or PVK_FONT")
+    try:
+        # Use truetype's underlying loader without its system-font search.
+        return ImageFont.FreeTypeFont(str(path), size)
+    except OSError as exc:
+        raise ValueError(f"Cannot load font {path}: {exc}; use --font or PVK_FONT") from exc
 
 
 def _gradient(size: tuple[int, int], top: tuple, bottom: tuple) -> Image.Image:
@@ -194,6 +218,7 @@ class Renderer:
     def __init__(
         self, portrait_a: Path, portrait_b: Path, font_path: Path, title: str,
         turns: list[dict], cues: list[dict], scenes: list[dict], fps: float = 24,
+        *, unmatched_words: Iterable[dict] = (), frame_window: range | None = None,
     ) -> None:
         self._fps = float(fps)
         if not (0 < self._fps < math.inf):
@@ -201,16 +226,29 @@ class Renderer:
         self._turns = _Timeline.build("turns", turns)
         self._cues = _Timeline.build("cues", cues)
         self._scenes = _Timeline.build("scenes", scenes)
+        self._unmatched_words = _Timeline.build("unmatched words", unmatched_words)
+        self._frame_window = frame_window
         self._font_path = font_path
         self._fonts: dict[int, ImageFont.FreeTypeFont] = {}
-        self._title = self._fit(title, 888, 47, 36, 20, "episode title", max_lines=1)
-        self._caption_text = [
-            self._fit(row["text"], 976 if row["speaker"] else 1104,
-                      132, 36, 19, f"caption at {start:g}s", preserve_spacing=True)
-            for start, row in zip(self._cues.starts, self._cues.rows)
-        ]
-        self._scene_text = [self._layout_concept(start, row)
-                            for start, row in zip(self._scenes.starts, self._scenes.rows)]
+        self._title = self._fit(title, 888, 47, _TITLE_FONT_SIZE, 20, "episode title", max_lines=1)
+        if frame_window is None:
+            caption_indices = range(len(self._cues.rows))
+            scene_indices = range(len(self._scenes.rows))
+        else:
+            caption_indices = [i for i, _ in self._cues.visible(frame_window, self._fps)]
+            # A sampled card can have zero opacity only at its opening instant.
+            scene_indices = [i for i, time in self._scenes.visible(frame_window, self._fps)
+                             if self._scene_mix(i, time) > 0]
+        self._caption_text = [None] * len(self._cues.rows)
+        for i in caption_indices:
+            row, start = self._cues.rows[i], self._cues.starts[i]
+            self._caption_text[i] = self._fit(
+                row["text"], 976 if row["speaker"] else 1104,
+                132, 36, 19, f"caption at {start:g}s", preserve_spacing=True,
+            )
+        self._scene_text = [None] * len(self._scenes.rows)
+        for i in scene_indices:
+            self._scene_text[i] = self._layout_concept(self._scenes.starts[i], self._scenes.rows[i])
         self._studio = _gradient(_SIZE, (26, 45, 54), (13, 25, 34))
         studios = {"A": _load_portrait(portrait_a), "B": _load_portrait(portrait_b)}
         # Seven static frames: idle wide, live wide for either host, and quiet/live
@@ -221,7 +259,7 @@ class Renderer:
 
     def _font(self, size: int) -> ImageFont.FreeTypeFont:
         if size not in self._fonts:
-            self._fonts[size] = ImageFont.truetype(str(self._font_path), size)
+            self._fonts[size] = load_font(self._font_path, size)
         return self._fonts[size]
 
     def _fit(
@@ -354,7 +392,7 @@ class Renderer:
 
     def _room(self, time: float, rms: float) -> Image.Image:
         i = self._turns.at(time)
-        if i < 0:
+        if i < 0 or self._unmatched_words.at(time) >= 0:
             return self._room_frames["wide", ""].copy()
         speaker = self._turns.rows[i]["speaker"]
         close = (time - self._turns.starts[i]) % 6.0 >= 0.60
@@ -409,29 +447,34 @@ class Renderer:
         self._last_caption = (i, y, patch)
         return y, patch
 
+    def _scene_mix(self, scene: int, time: float) -> float:
+        start, end = self._scenes.starts[scene], self._scenes.ends[scene]
+        # Cut between directly adjacent text cards and across very short cards.
+        cut_in = scene > 0 and self._scenes.ends[scene - 1] == start
+        cut_out = scene + 1 < len(self._scenes.rows) and self._scenes.starts[scene + 1] == end
+        fade = min(0.25, (end - start) / 4)
+        mix = 1.0
+        if fade >= 1 / self._fps:
+            if not cut_in:
+                mix = min(mix, (time - start) / fade)
+            if not cut_out:
+                mix = min(mix, (end - time) / fade)
+        return mix
+
     def frame(self, index: int, rms: float) -> Image.Image:
         """Return a fresh 1280 × 720 RGB still at ``index / fps``."""
         index = operator.index(index)
         if index < 0:
             raise ValueError("frame index must be non-negative")
+        if self._frame_window is not None and index not in self._frame_window:
+            raise ValueError("frame index falls outside the renderer's window")
         time = index / self._fps
         scene = self._scenes.at(time)
-        if scene < 0:
+        mix = self._scene_mix(scene, time) if scene >= 0 else 0.0
+        if mix == 0.0:
             image = self._room(time, rms)
         else:
-            start, end = self._scenes.starts[scene], self._scenes.ends[scene]
-            # Use a hard cut between directly adjacent text cards to avoid
-            # bringing presenters back between them. Also cut very short cards.
-            cut_in = scene > 0 and self._scenes.ends[scene - 1] == start
-            cut_out = scene + 1 < len(self._scenes.rows) and self._scenes.starts[scene + 1] == end
-            fade = min(0.25, (end - start) / 4)
             concept = self._concept(scene)
-            mix = 1.0
-            if fade >= 1 / self._fps:
-                if not cut_in:
-                    mix = min(mix, (time - start) / fade)
-                if not cut_out:
-                    mix = min(mix, (end - time) / fade)
             image = concept.copy() if mix >= 1.0 else Image.blend(self._room(time, rms), concept, mix)
         cue = self._cues.at(time)
         if cue >= 0:

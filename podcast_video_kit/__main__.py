@@ -17,8 +17,8 @@ import wave
 from xml.etree.ElementTree import ParseError
 from zipfile import BadZipFile
 
-from .episode import (IncompleteSegmentWords, align_with_provenance, captions,
-                      check_script_length, concept_scenes, read_words, script, srt)
+from .episode import (align_with_provenance, captions, check_script_length,
+                      concept_scenes, read_words, script, srt)
 
 FPS = 24
 SIZE = (1280, 720)
@@ -58,7 +58,7 @@ def duration_wav(path):
 
 def transcribe(args):
     if args.words_json:
-        return json.loads(args.words_json.read_text(encoding='utf-8'))
+        return args.words_json.read_bytes()
     if not args.whisper_model:
         raise ValueError('Supply an existing local --whisper-model .pt file or --words-json')
     model = args.whisper_model.resolve(strict=True)
@@ -74,7 +74,7 @@ def transcribe(args):
                  '--device', 'cpu', '--fp16', 'False', '--word_timestamps', 'True',
                  '--output_format', 'json', '--output_dir', tmp, '--verbose', 'False',
                  *(['--language', args.language.lower()] if args.language else [])])
-        return json.loads((Path(tmp) / (Path(wav).stem + '.json')).read_text(encoding='utf-8'))
+        return (Path(tmp) / (Path(wav).stem + '.json')).read_bytes()
 
 
 def extract_aac_hash(path):
@@ -130,7 +130,7 @@ def _validate_cue_frames(cues, first, last, offset, end):
                              'adjust the word timings or preview bounds')
 
 
-def make_video(args, directory, config, turns, cues, scenes, duration):
+def make_video(args, directory, config, turns, cues, scenes, duration, font, unmatched_words):
     first, last, offset, end = _render_window(args, duration)
     _validate_cue_frames(cues, first, last, offset, end)
     import numpy as np
@@ -138,11 +138,10 @@ def make_video(args, directory, config, turns, cues, scenes, duration):
 
     start = float(offset)
     length = float(end-offset)
-    font = args.font or Path(os.environ.get('PVK_FONT', str(MAC_FONT)))
-    if not font.is_file():
-        raise ValueError('Specify a local Korean-capable font with --font or PVK_FONT')
     renderer = Renderer(args.portrait_a, args.portrait_b, font,
-                        config.get('title', 'Podcast'), turns, cues, scenes, fps=FPS)
+                        config.get('title', 'Podcast'), turns, cues, scenes, fps=FPS,
+                        unmatched_words=unmatched_words,
+                        frame_window=range(first, last) if args.preview else None)
     audio = directory / 'audio.m4a'
     pcm = directory / 'analysis.wav'
     # Full mode never cuts, stretches, adds silence or resamples the delivery audio deliberately.
@@ -192,18 +191,21 @@ def build(args):
     cfg = json.loads(args.config.read_text(encoding='utf-8')) if args.config else {}
     if not isinstance(cfg, dict) or not isinstance(cfg.get('title', 'Podcast'), str):
         raise ValueError('Config must be a JSON object with an optional text title')
+    if not args.plan_only:
+        from .render import load_font
+
+        font = args.font or Path(os.environ.get('PVK_FONT', str(MAC_FONT)))
+        load_font(font)
     out = args.output.resolve()
     out.mkdir(mode=0o700, parents=True, exist_ok=False)
-    transcript = transcribe(args)
-    try:
-        words = read_words(transcript, float(duration))
-    except IncompleteSegmentWords:
-        raise
-    except ValueError:
-        # Preserve the raw cache for retry after existing timing/structure errors.
-        json_write(out / 'words.json', transcript)
-        raise
-    json_write(out / 'words.json', transcript)
+    raw = transcribe(args)
+    transcript = json.loads(raw.decode('utf-8'))
+    if args.whisper_model:
+        # Keep the generated cache verbatim so timing errors can be corrected and retried.
+        (out / 'words.json').write_bytes(raw)
+    words = read_words(transcript, float(duration))
+    if args.words_json:
+        (out / 'words.json').write_bytes(raw)
     aligned, weak, coverage, token_matches = align_with_provenance(turns, words)
     cues = captions(aligned, words, token_matches)
     scenes = concept_scenes(cfg, aligned)
@@ -214,7 +216,9 @@ def build(args):
     print(f'Plan: {len(aligned)} turns, alignment coverage {coverage:.0%}, '
           f'{len(weak)} low-coverage turns, {len(notes)} unlabeled paragraphs. Review plan.json.', flush=True)
     if not args.plan_only:
-        result = make_video(args, out, cfg, aligned, cues, scenes, duration)
+        unmatched_words = [dict(start=start, end=end)
+                           for (start, end, _), count in zip(words, token_matches) if count == 0]
+        result = make_video(args, out, cfg, aligned, cues, scenes, duration, font, unmatched_words)
         json_write(out / 'verification.json', result)
         print(f"Verified {result['mode']}: {result['frames']} frames; see verification.json", flush=True)
 

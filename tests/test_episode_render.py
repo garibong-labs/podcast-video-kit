@@ -3,7 +3,6 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import patch
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont
 
@@ -40,20 +39,12 @@ class RendererTests(unittest.TestCase):
             ImageDraw.Draw(portrait).ellipse((12, 5, 47, 74), fill=(*color, 255))
             portrait.save(path)
         # Keep the tests portable by using Pillow's embedded scalable font.
-        # load_default also calls truetype, using its own in-memory font bytes.
         self.font = self.root / "synthetic.ttf"
-        truetype = ImageFont.truetype
+        self.font.write_bytes(ImageFont.load_default(size=36).font_bytes)
 
-        def fixture_font(resource, size, *args, **kwargs):
-            if resource == str(self.font):
-                return ImageFont.load_default(size=size)
-            return truetype(resource, size, *args, **kwargs)
-
-        self.enterContext(patch.object(ImageFont, "truetype", side_effect=fixture_font))
-
-    def renderer(self, turns=(), cues=(), scenes=(), fps=24):
+    def renderer(self, turns=(), cues=(), scenes=(), fps=24, **options):
         return Renderer(self.a, self.b, self.font, "Test episode", list(turns), list(cues),
-                        list(scenes), fps)
+                        list(scenes), fps, **options)
 
     def assertSamePixels(self, a, b):
         self.assertIsNone(ImageChops.difference(a, b).getbbox())
@@ -127,6 +118,26 @@ class RendererTests(unittest.TestCase):
             self.assertEqual(pixel_count(renderer.frame(i, 0.2), _B), 0)
         for i in (60, 81):
             self.assertGreater(pixel_count(renderer.frame(i, 0.2), _B), 0)
+
+    def test_preview_pixels_keep_original_card_indices_neighbors_and_fades(self):
+        turns = [turn(0, 9, "B")]
+        scenes = [scene(0, 2), scene(2, 4), scene(4, 6), scene(6.5, 8.5)]
+        cues = [cue(0, 2, "B", "Earlier caption"), cue(2, 8, "B", "Visible caption")]
+        full = self.renderer(turns, cues, scenes)
+        giant = "line\n" * 40
+        oversized_scenes = [dict(row, body=giant) if i in (0, 2) else row
+                            for i, row in enumerate(scenes)]
+        oversized_cues = [dict(cues[0], text=giant), cues[1]]
+        for window, samples in [(range(48, 96), (48, 49, 60, 94, 95)),
+                                (range(159, 203), (159, 162, 185, 201, 202))]:
+            preview = self.renderer(turns, oversized_cues, oversized_scenes, frame_window=window)
+            for index in samples:
+                with self.subTest(frame=index):
+                    self.assertSamePixels(full.frame(index, 0.8), preview.frame(index, 0.8))
+        # The opening sample of the isolated card has zero opacity.
+        oversized_scenes[3] = dict(scenes[3], body=giant)
+        preview = self.renderer(turns, cues, oversized_scenes, frame_window=range(156, 157))
+        self.assertSamePixels(full.frame(156, 0.8), preview.frame(156, 0.8))
 
     def test_frames_do_not_mutate_assets_or_shared_cache(self):
         source = self.a.read_bytes()
