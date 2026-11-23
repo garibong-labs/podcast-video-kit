@@ -1,4 +1,6 @@
-# Private asset bundle
+# Private asset bundle — legacy reference
+
+For new episodes, see the [minimal input workflow](../README.md#new-episodes-docx--wav--two-portraits); the file list below is only for recreating the original edit.
 
 Obtain the existing functional-podcast asset folder through an authorized private transfer. Do not commit the folder or its sharing credentials. The initial adapter selects only these inputs:
 

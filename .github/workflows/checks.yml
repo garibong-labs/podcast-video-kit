@@ -13,5 +13,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu-core
+      - run: python -m pip install .
+      - run: podcast-video-kit --help
       - run: python -m unittest discover -s tests -v
-      - run: python -m compileall -q tools reference tests
+      - run: python -m compileall -q podcast_video_kit tools reference tests
