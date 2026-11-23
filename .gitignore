@@ -37,3 +37,10 @@ __pycache__/
 *.py[cod]
 .DS_Store
 *.log
+
+# Local installation/build artifacts and private documents
+*.egg-info/
+build/
+dist/
+*.docx
+*.pt

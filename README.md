@@ -2,13 +2,39 @@
 
 A local-first CLI project for turning narration, scripts, and character assets into repeatable podcast videos.
 
-## Current status
+## New episodes: DOCX + WAV + two portraits
 
-**Initial reference import, not a finished general-purpose CLI.** This version preserves a working Python/Pillow/NumPy/FFmpeg 2D pipeline and a safe asset-staging command. It can reproduce the existing functional-programming episode with its separately supplied private assets. Arbitrary new episodes, transcription, and configurable scene templates are planned, not implemented. Blender is not required.
+Use `podcast-video-kit` for new episodes. It is a local 2D renderer, not Blender or phoneme lip sync. It does not use cloud transcription, generate images, or require the reference episode's assets.
 
-The baseline uses six still-image camera views, amplitude-driven mouth animation, timed Korean captions, and animated concept overlays. It is not phoneme lip sync or real 3D animation.
+Requirements: Python 3.11+, FFmpeg (including libx264 and AAC) and ffprobe, a font that covers the script language, and either the OpenAI Whisper CLI with a trusted local model checkpoint or a matching local Whisper word-timestamp JSON. Apple SD Gothic Neo is used on macOS unless you set `--font` or `PVK_FONT`; on Linux, pick a local font with the required glyph coverage.
 
-## Quick start (macOS / Linux)
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+# Install openai-whisper separately in this environment if using --whisper-model.
+```
+
+```bash
+podcast-video-kit --script "private/script.docx" --narration "private/narration.wav" \
+  --portrait-a "private/A.png" --portrait-b "private/B.png" \
+  --whisper-model "$HOME/.cache/whisper/small.pt" --language ko \
+  --output runs/episode-preview --preview 30
+```
+
+The model file must already exist. Use a trusted model: its loading is delegated to Whisper. No model is downloaded by this command. The default heading is `7. 팟캐스트 대본`; specify a different one with `--section`. Dialogue starts with `A:` or `B:`. Matching keeps turn order, including repeat speakers; it does not identify speakers acoustically. Use portrait files in the same A/B order as the script and recording. Front-facing separate portraits work best. One image per person produces a wide two-portrait layout and 2D close-up, not six distinct camera angles. Portraits stay still; an audio level indicator shows active speech rather than animating the mouth.
+
+- Start with `--preview 30` and optionally `--preview-start 60` to inspect another part of the episode. Add `--plan-only` instead of preview to inspect alignment without rendering.
+- Review `plan.json`, especially low-coverage turns and unlabeled paragraphs (not silently read as dialogue). Subtitles come from the recording's ASR, not a verbatim copy of the script. Review ASR errors and speaker-to-portrait mapping yourself.
+- To render the full recording, repeat the command with a **new** `--output runs/episode-full`, change `--whisper-model … --language ko` to `--words-json runs/episode-preview/words.json`, and omit both preview flags. Reuse word JSON only with the WAV it came from. `captions.srt` and plan timestamps always refer to the full recording, even in a preview run.
+- The full render keeps the supplied recording intact in time (no cuts, added gaps, or speed changes). It encodes the WAV to AAC once, copies that AAC track into the MP4, and verifies the copy and full decode. A preview encodes only the selected excerpt. Use `verification.json` and check the playback yourself.
+- [Optional concept cards](docs/episodes.md) use explicitly supplied text and ranges in the script. No guesses are made about which words or numbers to teach. Keep the inputs and generated runs private; the command does not publish or overwrite them.
+
+## Reproduce the existing reference episode
+
+The following workflow is unchanged. It uses six prebuilt still-image views, amplitude-driven mouth animation, and timed concept scenes. To reproduce the original edit, use this reference workflow rather than the new-episode renderer.
+
+### Reference quick start (macOS / Linux)
 
 Requirements: Python 3.11+, FFmpeg with libx264 and AAC support, ffprobe on PATH, and a Korean-capable font. Install dependencies in a virtual environment:
 
@@ -55,14 +81,14 @@ Outputs are under `runs/reference/full-local/`. The renderer itself overwrites o
 
 ```bash
 python -m unittest discover -s tests -v
-python -m compileall -q tools reference tests
+python -m compileall -q podcast_video_kit tools reference tests
 ```
 
-These tests require no private episode assets. CI does not upload media or use external AI services. See [development plan](docs/roadmap.md), [baseline details](docs/baseline.md), and [public-repository safety](SECURITY.md).
+These tests require no private episode assets. With FFmpeg and the test font installed, they also exercise a full and preview render using synthetic fixtures. CI does not upload media or use external AI services. See [development plan](docs/roadmap.md), [baseline details](docs/baseline.md), and [public-repository safety](SECURITY.md).
 
 ## Known limitations
 
-- Episode-specific duration, labels, camera schedules and concept code remain hardcoded. This commit establishes a baseline for refactoring, not a generic product claim.
+- The legacy reference renderer still has hardcoded duration, layouts, and camera schedules. The new renderer is a simpler two-portrait layout, not a visual replica.
 - The reference has known concept-label alignment/spacing and worked-problem presentation defects. Preserve it as a comparison target, not a perfect design.
 - Automatic captions have not been fully proofread. Speaker timing uses script matching rather than acoustic diarization.
 - Changing fonts or dependency versions can change pixels, wrapping and encoded bytes. The baseline MP4 hash is an identity reference, not a guarantee of byte-identical re-encoding.
