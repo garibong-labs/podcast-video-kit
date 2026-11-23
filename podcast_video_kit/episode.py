@@ -10,6 +10,7 @@ from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 
 W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+MC = '{http://schemas.openxmlformats.org/markup-compatibility/2006}'
 SPEAKER = re.compile(r'^([AB])\s*[:：]\s*(.*)$')
 NUMBERED = re.compile(r'^(\d+)\s*[.)]\s+\S')
 OUTLINE_LEVELS = {str(level): level for level in range(9)}
@@ -158,6 +159,17 @@ def _paragraph_text(node):
     return ''.join(parts).strip()
 
 
+def _select_alternate_content(body):
+    # Modern Word stores some text boxes both as a choice and as a fallback.
+    # Prefer the first branch with readable Word text, or use the fallback.
+    for alternate in reversed(list(body.iter(MC + 'AlternateContent'))):
+        selected = next((choice for choice in alternate.findall(MC + 'Choice')
+                         if any(t.text for t in choice.iter(W + 't'))), None)
+        if selected is None:
+            selected = alternate.find(MC + 'Fallback')
+        alternate[:] = [] if selected is None else [selected]
+
+
 def script(path, heading):
     with ZipFile(path) as z:
         body = _word_xml(z, 'document.xml').find(W + 'body')
@@ -171,6 +183,7 @@ def script(path, heading):
             decimals, bullets, style_levels = {}, set(), {}
     if body is None:
         raise ValueError('DOCX has no document body')
+    _select_alternate_content(body)
     styles = {s.get(W + 'styleId'): s for s in styles_xml.findall(W + 'style')
               if s.get(W + 'type') == 'paragraph' and s.get(W + 'styleId')}
     default_style = next((sid for sid, style in styles.items()
@@ -403,12 +416,32 @@ def concept_scenes(config, turns):
 
 
 def srt(cues):
-    def stamp(seconds):
-        total = round(seconds*1000)
+    def stamp(total):
         m, ms = divmod(total, 1000)
         h, m = divmod(m, 3600)
         m, sec = divmod(m, 60)
         return f'{h:02d}:{m:02d}:{sec:02d},{ms:03d}'
-    return ''.join(f"{i}\n{stamp(c['start'])} --> {stamp(c['end'])}\n"
-                   + (c['speaker']+': ' if c['speaker'] else '') + c['text'] + '\n\n'
-                   for i,c in enumerate(cues,1))
+    times = [(c['start'] * 1000, c['end'] * 1000) for c in cues]
+    limits = [None] * len(times)
+    # Reserve a positive, non-overlapping millisecond for each later cue.
+    # Both endpoints may move to the floor or ceiling of their exact time.
+    next_start = math.inf
+    for i in reversed(range(len(times))):
+        start, end = times[i]
+        latest_end = min(math.ceil(end), next_start)
+        latest_start = min(math.ceil(start), latest_end - 1)
+        if latest_start < math.floor(start) or latest_end < math.floor(end):
+            raise ValueError(f'SRT cue {i + 1} cannot be represented without overlap '
+                             'or losing its duration at millisecond precision')
+        limits[i] = latest_start, latest_end
+        next_start = latest_start
+
+    lines = []
+    previous_end = 0
+    for i, (cue, (start, end), (latest_start, latest_end)) in enumerate(zip(cues, times, limits), 1):
+        start_ms = max(previous_end, min(round(start), latest_start))
+        end_ms = max(start_ms + 1, min(round(end), latest_end))
+        label = cue['speaker'] + ': ' if cue['speaker'] else ''
+        lines.append(f"{i}\n{stamp(start_ms)} --> {stamp(end_ms)}\n{label}{cue['text']}\n\n")
+        previous_end = end_ms
+    return ''.join(lines)

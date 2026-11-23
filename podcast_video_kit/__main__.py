@@ -36,7 +36,7 @@ def json_write(path, obj):
 
 def probe(path, *args):
     return json.loads(command(['ffprobe', '-v', 'error', *args, '-show_streams',
-                               '-show_format', '-of', 'json', str(path)], capture=True))
+                               '-show_format', '-of', 'json', str(path.absolute())], capture=True))
 
 
 def duration_wav(path):
@@ -149,7 +149,8 @@ def make_video(args, directory, config, turns, cues, scenes, duration, font, unm
     audio = directory / 'audio.m4a'
     pcm = directory / 'analysis.wav'
     # Full mode never cuts, stretches, adds silence or resamples the delivery audio deliberately.
-    excerpt = ['-ss', str(start), '-t', str(length)] if args.preview else []
+    # FFmpeg expects decimal seconds, not exponent notation for short excerpts.
+    excerpt = ['-ss', f'{start:.9f}', '-t', f'{length:.9f}'] if args.preview else []
     for dest, settings in ((audio, ['-c:a', 'aac', '-b:a', '192k']),
                            (pcm, ['-c:a', 'pcm_s16le', '-ar', '24000', '-ac', '1'])):
         command(['ffmpeg', '-nostdin', '-n', '-v', 'error', '-xerror', '-f', 'wav', '-i',
