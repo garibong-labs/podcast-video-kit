@@ -19,8 +19,9 @@ animated source is used. No face detection, mouth deformation, or lip sync:
 the current speaker gets a lit label and a small level meter above the silence
 threshold. The turn, not the RMS, controls the camera; it stays put during
 brief silence. There is no font fallback; supply a scalable font with glyphs
-and shaping support for the episode's languages. Wrapping normalizes horizontal
-whitespace, preserves explicit newlines, and may split an overwide token. If
+and shaping support for the episode's languages. Wrapping keeps the original
+separators within caption lines, normalizes other horizontal whitespace,
+preserves explicit newlines, and may split an overwide token. If
 copy still cannot fit at the minimum type size, construction raises ValueError
 instead of clipping or dropping text. Split dense cues or cards upstream.
 """
@@ -32,6 +33,7 @@ from dataclasses import dataclass
 import math
 import operator
 from pathlib import Path
+import re
 import unicodedata
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -111,7 +113,8 @@ def _load_portrait(path: Path) -> Image.Image:
     return portrait.crop(bounds) if bounds != (0, 0, *portrait.size) else portrait
 
 
-def _wrap(text: str, font: ImageFont.FreeTypeFont, width: int, max_lines: int) -> list[str] | None:
+def _wrap(text: str, font: ImageFont.FreeTypeFont, width: int, max_lines: int,
+          *, preserve_spacing: bool = False) -> list[str] | None:
     """Use ink bounds (including overhangs), preserving all non-whitespace text."""
     def fits(line: str) -> bool:
         left, _, right, _ = font.getbbox(line, anchor="ls")
@@ -120,8 +123,12 @@ def _wrap(text: str, font: ImageFont.FreeTypeFont, width: int, max_lines: int) -
     lines = []
     for paragraph in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         line = ""
-        for word in paragraph.split():
-            joined = f"{line} {word}" if line else word
+        previous_end = 0
+        for match in re.finditer(r"\S+", paragraph):
+            separator = paragraph[previous_end:match.start()] if preserve_spacing else " "
+            previous_end = match.end()
+            word = match[0]
+            joined = line + separator + word if line else word
             if fits(joined):
                 line = joined
                 continue
@@ -198,7 +205,7 @@ class Renderer:
         self._title = self._fit(title, 888, 47, 36, 20, "episode title", max_lines=1)
         self._caption_text = [
             self._fit(row["text"], 976 if row["speaker"] else 1104,
-                      132, 36, 19, f"caption at {start:g}s")
+                      132, 36, 19, f"caption at {start:g}s", preserve_spacing=True)
             for start, row in zip(self._cues.starts, self._cues.rows)
         ]
         self._scene_text = [self._layout_concept(start, row)
@@ -218,7 +225,7 @@ class Renderer:
 
     def _fit(
         self, text: str, width: int, height: int, size: int, minimum: int,
-        field: str, max_lines: int | None = None,
+        field: str, max_lines: int | None = None, *, preserve_spacing: bool = False,
     ) -> _Text:
         for point in range(size, minimum - 1, -1):
             font = self._font(point)
@@ -227,7 +234,7 @@ class Renderer:
             limit = height // (ascent + descent + gap) + 1
             if max_lines is not None:
                 limit = min(limit, max_lines)
-            lines = _wrap(text, font, width, limit)
+            lines = _wrap(text, font, width, limit, preserve_spacing=preserve_spacing)
             if lines is None:
                 continue
             boxes = [font.getbbox(line, anchor="ls") for line in lines]

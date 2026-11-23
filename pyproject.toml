@@ -7,7 +7,7 @@ name = "podcast-video-kit"
 version = "0.1.0"
 description = "Local 2D podcast video CLI"
 requires-python = ">=3.11"
-dependencies = ["numpy>=1.26,<3", "Pillow>=10,<13"]
+dependencies = ["numpy>=1.26,<3", "Pillow>=10.1,<13"]
 
 [project.scripts]
 podcast-video-kit = "podcast_video_kit.__main__:main"

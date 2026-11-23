@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from fractions import Fraction
 import hashlib
 import json
 import math
@@ -43,8 +44,12 @@ def duration_wav(path):
     streams = probe(path, '-f', 'wav')['streams']
     if len(streams) != 1 or streams[0]['codec_type'] != 'audio':
         raise ValueError('Narration WAV must contain one audio stream')
-    seconds = float(streams[0]['duration'])
-    if not math.isfinite(seconds) or not 0 < seconds <= 7200:
+    try:
+        stream = streams[0]
+        seconds = int(stream['duration_ts']) * Fraction(stream['time_base'])
+    except (KeyError, TypeError, ValueError, ZeroDivisionError) as exc:
+        raise ValueError('Cannot determine the exact WAV duration from ffprobe') from exc
+    if not 0 < seconds <= 7200:
         raise ValueError('Narration must be between 0 and 7200 seconds')
     return seconds
 
@@ -100,12 +105,13 @@ def make_video(args, directory, config, turns, cues, scenes, duration):
 
     # Index previews on the same frame grid, so caption and scene boundaries do not drift.
     total = math.ceil(duration * FPS)
-    first = round(args.preview_start * FPS) if args.preview else 0
-    last = min(total, first + math.ceil(args.preview * FPS)) if args.preview else total
+    first = round(Fraction(str(args.preview_start)) * FPS) if args.preview else 0
+    last = min(total, first + math.ceil(Fraction(str(args.preview)) * FPS)) if args.preview else total
     if first >= last:
         raise ValueError('Preview starts after the recording ends')
-    start = first/FPS
-    length = min(duration-start, (last-first)/FPS)
+    offset = Fraction(first, FPS)
+    start = float(offset)
+    length = float(min(duration-offset, Fraction(last-first, FPS)))
     font = args.font or Path(os.environ.get('PVK_FONT', str(MAC_FONT)))
     if not font.is_file():
         raise ValueError('Specify a local Korean-capable font with --font or PVK_FONT')
@@ -154,7 +160,7 @@ def build(args):
             raise ValueError(f'Input file not found: {file}')
     turns, notes = script(args.script, args.section)
     duration = duration_wav(args.narration)
-    if args.preview and round(args.preview_start*FPS)/FPS >= duration:
+    if args.preview and Fraction(round(Fraction(str(args.preview_start))*FPS), FPS) >= duration:
         raise ValueError('Preview starts after the recording ends')
     cfg = json.loads(args.config.read_text(encoding='utf-8')) if args.config else {}
     if not isinstance(cfg, dict) or not isinstance(cfg.get('title', 'Podcast'), str):
@@ -162,12 +168,12 @@ def build(args):
     out = args.output.resolve()
     out.mkdir(mode=0o700, parents=True, exist_ok=False)
     transcript = transcribe(args, out)
-    words = read_words(transcript, duration)
     json_write(out / 'words.json', transcript)
+    words = read_words(transcript, float(duration))
     aligned, weak, coverage = align(turns, words)
     cues = captions(aligned, words)
     scenes = concept_scenes(cfg, aligned)
-    json_write(out / 'plan.json', dict(duration=duration, script_character_coverage=coverage,
+    json_write(out / 'plan.json', dict(duration=float(duration), script_character_coverage=coverage,
                low_coverage_turns=weak, turns=aligned, unlabeled_paragraphs=notes,
                captions=cues, scenes=scenes))
     (out / 'captions.srt').write_text(srt(cues), encoding='utf-8')

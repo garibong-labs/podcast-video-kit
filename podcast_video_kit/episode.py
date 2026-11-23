@@ -12,39 +12,79 @@ from zipfile import ZipFile
 W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
 SPEAKER = re.compile(r'^([AB])\s*[:：]\s*(.*)$')
 NUMBERED = re.compile(r'^(\d+)\s*[.)]\s*\S')
+OUTLINE_LEVELS = {str(level): level for level in range(9)}
 
 
 def normalized(text):
     return ''.join(c for c in unicodedata.normalize('NFKC', text).casefold() if c.isalnum())
 
 
-def script(path, heading):
-    with ZipFile(path) as z:
-        document = z.getinfo('word/document.xml')
-        if document.file_size > 8_000_000:
-            raise ValueError('DOCX document.xml exceeds 8 MB')
-        data = z.read(document).decode('utf-8-sig')
+def _word_xml(archive, name):
+    member = archive.getinfo(f'word/{name}')
+    if member.file_size > 8_000_000:
+        raise ValueError(f'DOCX {name} exceeds 8 MB')
+    data = archive.read(member).decode('utf-8-sig')
     if '<!DOCTYPE' in data.upper() or '<!ENTITY' in data.upper():
         raise ValueError('DOCX XML declarations with DTD/entities are not supported')
-    body = ET.fromstring(data).find(W + 'body')
+    return ET.fromstring(data)
+
+
+def _property(node, name):
+    child = node.find('/'.join(W + part for part in name.split('/')))
+    return child.get(W + 'val') if child is not None else None
+
+
+def _outline(node, styles, default_style, default_outline):
+    style_id = _property(node, 'pPr/pStyle') or default_style
+    level = _property(node, 'pPr/outlineLvl')
+    current, seen = style_id, set()
+    while level is None and current in styles and current not in seen:
+        seen.add(current)
+        style = styles[current]
+        level = _property(style, 'pPr/outlineLvl')
+        current = _property(style, 'basedOn')
+    if level is not None:
+        # 9 denotes body text and explicitly overrides an inherited heading.
+        return OUTLINE_LEVELS.get(level)
+    builtin = re.fullmatch(r'Heading([1-9])', style_id or '', re.I)
+    if builtin:
+        return int(builtin[1]) - 1
+    return OUTLINE_LEVELS.get(default_outline)
+
+
+def script(path, heading):
+    with ZipFile(path) as z:
+        body = _word_xml(z, 'document.xml').find(W + 'body')
+        try:
+            styles_xml = _word_xml(z, 'styles.xml')
+        except KeyError:  # Some exporters omit styles.xml entirely.
+            styles_xml = ET.Element(W + 'styles')
     if body is None:
         raise ValueError('DOCX has no document body')
+    styles = {s.get(W + 'styleId'): s for s in styles_xml.findall(W + 'style')
+              if s.get(W + 'type') == 'paragraph' and s.get(W + 'styleId')}
+    default_style = next((sid for sid, style in styles.items()
+                          if style.get(W + 'default') in ('1', 'true', 'on')), None)
+    default_outline = _property(styles_xml, 'docDefaults/pPrDefault/pPr/outlineLvl')
     rows = []
     for node in body.iter(W + 'p'):
-        style = node.find(f'{W}pPr/{W}pStyle')
         text = ''.join((p.text or '') if p.tag == W + 't' else ' '
                        for p in node.iter() if p.tag in {W + 't', W + 'br', W + 'tab'})
-        rows.append((text.strip(), '' if style is None else style.get(W + 'val', '')))
+        rows.append((text.strip(), _outline(node, styles, default_style, default_outline)))
     matching = [i for i, (t, _) in enumerate(rows) if normalized(t) == normalized(heading)]
     if len(matching) != 1:
         raise ValueError('Expected one script heading; supply the exact heading with --section')
     first = matching[0]
     start_number = NUMBERED.match(rows[first][0])
-    heading_level = re.fullmatch(r'Heading(\d+)', rows[first][1], re.I)
+    heading_level = rows[first][1]
     turns, notes = [], []
-    for i, (text, style) in enumerate(rows[first + 1:], first + 2):
+    for i, (text, level) in enumerate(rows[first + 1:], first + 2):
         if not text:
             continue
+        n = NUMBERED.match(text)
+        if ((n and start_number and int(n[1]) == int(start_number[1]) + 1)
+                or (level is not None and heading_level is not None and level <= heading_level)):
+            break
         match = SPEAKER.match(text)
         if match:
             speaker, line = match.groups()
@@ -52,11 +92,6 @@ def script(path, heading):
                 raise ValueError(f'Paragraph {i}: missing dialogue after speaker label')
             turns.append({'speaker': speaker, 'text': line, 'paragraph': i})
             continue
-        n = NUMBERED.match(text)
-        level = re.fullmatch(r'Heading(\d+)', style, re.I)
-        if ((n and start_number and int(n[1]) == int(start_number[1]) + 1)
-                or (level and heading_level and int(level[1]) <= int(heading_level[1]))):
-            break
         notes.append({'paragraph': i, 'after_turn': len(turns), 'text': text})
     if not turns:
         raise ValueError('Selected section contains no A:/B: dialogue')
@@ -64,19 +99,38 @@ def script(path, heading):
 
 
 def read_words(transcript, duration):
+    if not isinstance(transcript, dict) or not isinstance(transcript.get('segments'), list):
+        raise ValueError('Expected Whisper JSON with a segments array')
     words = []
     previous = 0.0
-    for seg in transcript['segments']:
-        for w in seg.get('words', []):
+    for i, seg in enumerate(transcript['segments']):
+        if not isinstance(seg, dict):
+            raise ValueError(f'ASR segments[{i}] must be an object')
+        entries = seg.get('words', [])
+        if not isinstance(entries, list):
+            raise ValueError(f'ASR segments[{i}].words must be an array')
+        for j, w in enumerate(entries):
+            location = f'segments[{i}].words[{j}]'
+            if not isinstance(w, dict) or not isinstance(w.get('word'), str):
+                raise ValueError(f'ASR {location} must be an object with string word text')
             text = w['word']
-            start, end = float(w['start']), float(w['end'])
+            try:
+                start, end = w['start'], w['end']
+                if type(start) not in (int, float, str) or type(end) not in (int, float, str):
+                    raise ValueError('expected numeric seconds')
+                start, end = float(start), float(end)
+            except (KeyError, ValueError, OverflowError) as exc:
+                raise ValueError(f'ASR {location} requires numeric start/end timestamps') from exc
             if (not math.isfinite(start) or not math.isfinite(end) or start < 0
                     or end > duration + .25 or end < start):
-                raise ValueError('ASR has invalid or out-of-range word timestamps')
+                raise ValueError(f'ASR {location} has invalid or out-of-range word timestamps')
             if start + .1 < previous:
-                raise ValueError('ASR word timestamps go backwards')
-            start, end = min(duration, max(start, previous)), min(duration, max(start, end))
-            if end > start and text.strip():
+                raise ValueError(f'ASR {location} timestamps go backwards')
+            timed = start < end
+            start, end = min(duration, max(start, previous)), min(duration, end)
+            if text.strip():
+                if not timed or end <= start:
+                    raise ValueError(f'ASR {location} has no positive duration; correct its timestamps before aligning')
                 words.append((start, end, text))
                 previous = end
     if not words:
@@ -93,8 +147,11 @@ def align(turns, words):
     audio_text = ''.join(asr_parts)
     if max(len(script_text), len(audio_text)) > 30_000:
         raise ValueError('This aligner supports up to 30,000 normalized characters; split into episodes')
-    times = [(a + (b-a)*i/len(part), a + (b-a)*(i+1)/len(part))
-             for (a, b, _), part in zip(words, asr_parts) for i in range(len(part))]
+    times = []
+    for (a, b, _), part in zip(words, asr_parts):
+        if part:
+            boundaries = [a, *(a + (b-a)*i/len(part) for i in range(1, len(part))), b]
+            times.extend(zip(boundaries, boundaries[1:]))
     matches = {}
     for a, b, size in SequenceMatcher(None, script_text, audio_text, autojunk=False).get_matching_blocks():
         matches.update((a+i, b+i) for i in range(size))
@@ -123,13 +180,14 @@ def captions(turns, words):
         mid = (a+b)/2
         j = bisect_right(starts, mid)-1
         speaker = turns[j]['speaker'] if j >= 0 and mid < turns[j]['end'] else ''
-        text = raw.strip()
-        line = (out[-1]['text'] + ' ' + text) if out else text
+        line = (out[-1]['text'] + raw) if out else raw
         if (out and speaker == out[-1]['speaker'] and a-out[-1]['end'] <= .6
-                and b-out[-1]['start'] <= 5 and len(line) <= 54):
+                and b-out[-1]['start'] <= 5 and len(line.strip()) <= 54):
             out[-1].update(end=b, text=line)
         else:
-            out.append({'start': a, 'end': b, 'speaker': speaker, 'text': text})
+            out.append({'start': a, 'end': b, 'speaker': speaker, 'text': raw})
+    for cue in out:
+        cue['text'] = cue['text'].strip()
     return out
 
 

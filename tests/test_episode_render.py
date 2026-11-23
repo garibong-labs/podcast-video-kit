@@ -176,6 +176,11 @@ class RendererTests(unittest.TestCase):
         self.assertEqual(_wrap("iiiiiiiiii", font, width, 2), ["iiiiiiiiii"])
         self.assertGreater(len(_wrap("WWWWWWWWWW", font, width, 3)), 1)
 
+    def test_caption_layout_preserves_unspaced_text_and_internal_separators(self):
+        text = "今日は晴れ  Hello\u00a0world"
+        renderer = self.renderer(cues=[cue(0, 1, "A", text)])
+        self.assertEqual([line for line, _ in renderer._caption_text[0].lines], [text])
+
     def test_explicit_kind_and_body_change_the_card_not_the_outside_frame(self):
         first = self.renderer(scenes=[scene(0, 1, kind="Example")])
         second = self.renderer(scenes=[scene(0, 1, body="left = 5\nright = 7", kind="Example")])
