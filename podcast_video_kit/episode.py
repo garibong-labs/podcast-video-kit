@@ -18,7 +18,17 @@ MAX_ALIGNMENT_CHARS = 30_000
 
 
 def normalized(text):
-    return ''.join(c for c in unicodedata.normalize('NFKC', text).casefold() if c.isalnum())
+    folded = unicodedata.normalize('NFKC', text).casefold()
+    chars = []
+    attached = False
+    for char in unicodedata.normalize('NFC', folded):
+        if char.isalnum():
+            attached = True
+        elif not (attached and unicodedata.category(char).startswith('M')):
+            attached = False
+            continue
+        chars.append(char)
+    return ''.join(chars)
 
 
 def _check_alignment_length(length):
@@ -130,6 +140,24 @@ def _unsupported_numbering(paragraph):
                       'or section boundary; use typed section numbers or Word outline headings')
 
 
+def _paragraph_text(node):
+    # A drawing may contain independently visited Word paragraphs. Read only
+    # text belonging to this paragraph, in document order.
+    stack = [iter(node)]
+    parts = []
+    while stack:
+        child = next(stack[-1], None)
+        if child is None:
+            stack.pop()
+        elif child.tag == W + 't':
+            parts.append(child.text or '')
+        elif child.tag in (W + 'br', W + 'tab'):
+            parts.append(' ')
+        elif child.tag != W + 'p':
+            stack.append(iter(child))
+    return ''.join(parts).strip()
+
+
 def script(path, heading):
     with ZipFile(path) as z:
         body = _word_xml(z, 'document.xml').find(W + 'body')
@@ -152,8 +180,7 @@ def script(path, heading):
     counts = {}
     rows = []
     for node in body.iter(W + 'p'):
-        text = ''.join((p.text or '') if p.tag == W + 't' else ' '
-                       for p in node.iter() if p.tag in {W + 't', W + 'br', W + 'tab'}).strip()
+        text = _paragraph_text(node)
         style_id = _property(node, 'pPr/pStyle') or default_style
         inherited = tuple(_style_chain(style_id, styles))
         outline = _outline(node, style_id, inherited, default_outline)
@@ -193,7 +220,7 @@ def script(path, heading):
         if level is not None and heading_level is not None and level <= heading_level:
             break
         is_bullet = list_level == '0' and num_id in bullets
-        n = None if is_bullet else NUMBERED.match(text)
+        n = None if is_bullet or list_level in NESTED_LIST_LEVELS else NUMBERED.match(text)
         if n and start_number and int(n[1]) == int(start_number[1]) + 1:
             break
         match = SPEAKER.match(text)
@@ -223,6 +250,7 @@ def read_words(transcript, duration):
         raise ValueError('Expected Whisper JSON with a segments array')
     words = []
     previous = 0.0
+    separators = []
     for i, seg in enumerate(transcript['segments']):
         if not isinstance(seg, dict):
             raise ValueError(f'ASR segments[{i}] must be an object')
@@ -248,15 +276,19 @@ def read_words(transcript, duration):
             if (not math.isfinite(start) or not math.isfinite(end) or start < 0
                     or end > duration + .25 or end < start):
                 raise ValueError(f'ASR {location} has invalid or out-of-range word timestamps')
+            if not text.strip():
+                if text:
+                    separators.append(text)
+                continue
             if start + .1 < previous:
                 raise ValueError(f'ASR {location} timestamps go backwards')
             timed = start < end
             start, end = min(duration, max(start, previous)), min(duration, end)
-            if text.strip():
-                if not timed or end <= start:
-                    raise ValueError(f'ASR {location} has no positive duration; correct its timestamps before aligning')
-                words.append((start, end, text))
-                previous = end
+            if not timed or end <= start:
+                raise ValueError(f'ASR {location} has no positive duration; correct its timestamps before aligning')
+            words.append((start, end, ''.join(separators) + text))
+            separators.clear()
+            previous = end
         if len(words) == before and segment_text.strip():
             raise ValueError(f'ASR segments[{i}] has text but no usable word timestamps')
         if 'text' in seg and normalized(segment_text) != normalized(''.join(w[2] for w in words[before:])):
@@ -264,6 +296,9 @@ def read_words(transcript, duration):
                 f'ASR segments[{i}].text does not match its timed words; correct the segment before aligning')
     if not words:
         raise ValueError('Expected Whisper JSON with nonempty word timestamps')
+    if separators:
+        start, end, text = words[-1]
+        words[-1] = (start, end, text + ''.join(separators))
     return words
 
 

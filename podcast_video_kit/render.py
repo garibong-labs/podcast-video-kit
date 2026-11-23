@@ -130,11 +130,14 @@ def _gradient(size: tuple[int, int], top: tuple, bottom: tuple) -> Image.Image:
 
 
 def _load_portrait(path: Path) -> Image.Image:
-    with Image.open(path) as source:
-        portrait = ImageOps.exif_transpose(source).convert("RGBA")
+    try:
+        with Image.open(path) as source:
+            portrait = ImageOps.exif_transpose(source).convert("RGBA")
+    except (OSError, ValueError, Image.DecompressionBombError) as exc:
+        raise ValueError(f"Cannot decode portrait {path}: {exc}") from exc
     bounds = portrait.getbbox()  # RGBA getbbox uses alpha, not hidden RGB values.
     if bounds is None:
-        raise ValueError("portrait is fully transparent")
+        raise ValueError(f"Cannot use portrait {path}: portrait is fully transparent")
     return portrait.crop(bounds) if bounds != (0, 0, *portrait.size) else portrait
 
 

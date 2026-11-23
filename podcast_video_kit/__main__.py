@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from bisect import bisect_left
+from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 import hashlib
 import json
@@ -106,10 +107,13 @@ def verify(video, aac, nframes, audio_seconds):
 def _render_window(args, duration):
     # Index previews on the same frame grid, so caption and scene boundaries do not drift.
     total = math.ceil(duration * FPS)
-    first = round(Fraction(str(args.preview_start)) * FPS) if args.preview else 0
-    last = min(total, first + math.ceil(Fraction(str(args.preview)) * FPS)) if args.preview else total
-    if first >= last:
-        raise ValueError('Preview starts after the recording ends')
+    first, last = 0, total
+    if args.preview:
+        requested = Fraction(str(args.preview_start))
+        if requested < 0 or requested >= duration:
+            raise ValueError('Preview starts outside the recording or at its end')
+        first = min(total - 1, round(requested * FPS))
+        last = min(total, first + math.ceil(Fraction(str(args.preview)) * FPS))
     offset = Fraction(first, FPS)
     return first, last, offset, min(duration, Fraction(last, FPS))
 
@@ -192,10 +196,12 @@ def build(args):
     if not isinstance(cfg, dict) or not isinstance(cfg.get('title', 'Podcast'), str):
         raise ValueError('Config must be a JSON object with an optional text title')
     if not args.plan_only:
-        from .render import load_font
+        from .render import _load_portrait, load_font
 
         font = args.font or Path(os.environ.get('PVK_FONT', str(MAC_FONT)))
         load_font(font)
+        for portrait in (args.portrait_a, args.portrait_b):
+            _load_portrait(portrait)
     out = args.output.resolve()
     out.mkdir(mode=0o700, parents=True, exist_ok=False)
     raw = transcribe(args)
@@ -231,10 +237,22 @@ def positive(value):
 
 
 def finite_seconds(value):
-    n = float(value)
-    if not math.isfinite(n):
+    try:
+        seconds = Decimal(value)
+    except InvalidOperation as exc:
+        raise argparse.ArgumentTypeError('Use a finite preview offset') from exc
+    if not seconds.is_finite():
         raise argparse.ArgumentTypeError('Use a finite preview offset')
-    return n
+    if not seconds:
+        return Fraction(0)
+    if seconds.adjusted() < -12:
+        # Sub-picosecond offsets always map to frame zero on valid WAVs.
+        # Keep the sign without expanding arbitrary negative exponents.
+        return Fraction(-1 if seconds.is_signed() else 1, 10**12)
+    if seconds.adjusted() > 20:
+        # Far beyond any WAV duration; avoid expanding arbitrary exponents.
+        raise argparse.ArgumentTypeError('Preview offset is out of range')
+    return Fraction(seconds)
 
 
 def main(argv=None):
@@ -254,7 +272,7 @@ def main(argv=None):
     mode = arg.add_mutually_exclusive_group()
     mode.add_argument('--preview', type=positive, metavar='SECONDS', help='Render only a sample; default is full')
     mode.add_argument('--plan-only', action='store_true', help='Only generate alignment, scene plan and SRT')
-    arg.add_argument('--preview-start', type=finite_seconds, default=0.0, metavar='SECONDS')
+    arg.add_argument('--preview-start', type=finite_seconds, default=Fraction(0), metavar='SECONDS')
     args = arg.parse_args(argv)
     try:
         build(args)
