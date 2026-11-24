@@ -6,7 +6,7 @@ A local-first CLI project for turning narration, scripts, and character assets i
 
 Use `podcast-video-kit` for new episodes. It is a local 2D renderer, not Blender or phoneme lip sync. It does not use cloud transcription, generate images, or require the reference episode's assets.
 
-Requirements: Python 3.11+, FFmpeg (including libx264 and AAC) and ffprobe, a font that covers the script language, and either the OpenAI Whisper CLI with a trusted local model checkpoint or a matching local Whisper word-timestamp JSON. Apple SD Gothic Neo is used on macOS unless you set `--font` or `PVK_FONT`; on Linux, pick a local font with the required glyph coverage.
+Requirements: Python 3.11+, FFmpeg (including libx264 and AAC) and ffprobe, a font that covers the script language, and either the OpenAI Whisper CLI with a trusted local model checkpoint or a matching local Whisper word-timestamp JSON. Apple SD Gothic Neo is used on macOS unless you set `font` in `episode.json` or set `PVK_FONT`; on Linux, pick a local font with the required glyph coverage.
 
 On macOS, install FFmpeg and ffprobe with Homebrew.
 
