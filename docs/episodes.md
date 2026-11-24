@@ -29,6 +29,8 @@ Replace the sample values with measurements from each portrait. Open the origina
 
 The renderer stretches a small region of the original portrait and adds a shaded inner-mouth opening. The current speaker's audio level selects a cached pose; during silence, unmatched speech, and the other speaker's turn, the portrait returns to the original image. This is not phoneme lip sync. Use a short `--preview` with both speakers and a pause to check the landmarks before rendering the whole episode. Keep episode-specific calibration private.
 
+If the dark inner-mouth opening extends past the corners of the lips during speech, keep `x` and `y` fixed and reduce the third value (`width`) for that portrait. Re-render the same excerpt into a fresh output directory and check a close-up while the speaker is talking. Adjust each portrait separately: a mouth viewed at an angle can look narrower than a front-facing mouth.
+
 ## Optional concept cards
 
 Supply `--config private/episode.json` using this structure:
