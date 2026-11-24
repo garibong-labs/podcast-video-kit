@@ -15,6 +15,7 @@ from xml.sax.saxutils import escape
 from zipfile import ZipFile
 
 from podcast_video_kit.__main__ import _render_window, _validate_cue_frames, duration_wav, main
+from podcast_video_kit import episode
 from podcast_video_kit.episode import (align, align_with_provenance, captions, concept_scenes,
                                        read_words, repair_zero_duration, script, srt)
 
@@ -654,6 +655,29 @@ class PlanningTests(unittest.TestCase):
             self.assertAlmostEqual(actual[0], start)
             self.assertAlmostEqual(actual[1], end)
 
+    def test_caption_repair_work_scales_with_independent_regions(self):
+        def measure(count):
+            turns, rows = [], []
+            for i in range(count):
+                offset = 2 * i
+                greeting, answer = f'Hello{i}', f'Yes{i}'
+                turns.extend([dict(speaker='A', text=f'{greeting} there'), dict(speaker='B', text=answer)])
+                rows.extend(dict(start=offset+a, end=offset+b, word=text) for a, b, text in
+                            ((0, 1, f' {greeting}'), (1, 1, ' there'), (1, 1.04, f' {answer}')))
+            source = {'segments': [{'words': rows}]}
+            with patch.object(episode, '_repair_words', wraps=episode._repair_words) as repair:
+                prepared = episode.prepare_word_timings(source, 2 * count, repair=True, frame_rate=24)
+                _, _, (*_, cues) = episode.plan_word_alignment(turns, source, 2 * count, prepared, frame_rate=24)
+            sizes = [sum(len(seg['words']) for seg in call.args[0]['segments']) for call in repair.call_args_list]
+            self.assertEqual(len(cues), 2 * count)
+            _validate_cue_frames(cues, 0, 48 * count, Fraction(0), Fraction(2 * count))
+            self.assertEqual(sizes.count(len(rows)), 1)
+            return sum(sizes)
+
+        small = measure(8)
+        large = measure(32)
+        self.assertLessEqual(large, 5 * small)
+
     def test_concepts_preserve_explicit_body_and_reject_overlap(self):
         turns = [dict(start=0, end=3), dict(start=3.5, end=5)]
         item = dict(first_turn=1, last_turn=2, title='Example', body='1 → 2')
@@ -741,6 +765,22 @@ class MediaSmokeTest(unittest.TestCase):
         self.assertEqual(cues[2]['start'], 1.01)
         self.assertLessEqual(cues[1]['start'], 1)
         self.assertGreater(cues[1]['end'], 1)
+
+    def test_repair_checks_interior_trim_splits(self):
+        cues = self._render_caption_repair(
+            ['A: One', 'B: Two', 'A: Three Four'],
+            [(.02, .10, 'One'), (.10, .10, ' Two'), (.10, .10, ' Three'), (.10, .16, ' Four')],
+            3840)
+        self.assertLessEqual(cues[1]['start'], 2 / 24)
+        self.assertGreater(cues[1]['end'], 2 / 24)
+
+    def test_repair_followup_can_change_an_earlier_loan_from_same_donor(self):
+        cues = self._render_caption_repair(
+            ['A: One Two Three', 'B: Four', 'A: Five'],
+            [(.04, .08, 'One'), (.08, .08, ' Two'), (.08, .14, ' Three'),
+             (.14, .14, ' Four'), (.14, .18, ' Five')], 4320)
+        self.assertLessEqual(cues[1]['start'], 3 / 24)
+        self.assertGreater(cues[1]['end'], 3 / 24)
 
     def _render_caption_repair(self, script_lines, entries, samples):
         from PIL import Image

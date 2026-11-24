@@ -7,6 +7,7 @@ import unicodedata
 from bisect import bisect_right
 from copy import deepcopy
 from difflib import SequenceMatcher
+from itertools import accumulate
 from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 
@@ -354,6 +355,19 @@ def _frame_hits(lo, hi, count, frame_rate):
     return hits
 
 
+def _trim_splits(lo, width, count, low, high, fps):
+    """Try both endpoints and each open interval between frame crossings."""
+    cuts = {low, high}
+    for i in range(count + 1):
+        edge = lo + i * width / count
+        for n in range(math.ceil((edge - high) * fps), math.floor((edge - low) * fps) + 1):
+            cut = edge - n / fps
+            if low < cut < high:
+                cuts.add(cut)
+    edges = sorted(cuts)
+    return tuple(edges + [(a + b) / 2 for a, b in zip(edges, edges[1:]) if b - a > 1e-10])
+
+
 def repair_zero_duration(transcript, duration, *, frame_rate=None):
     """Estimate zero-width nonblank tokens with limited neighboring boundary edits."""
     return _repair_words(transcript, duration, frame_rate, {}, {})
@@ -374,56 +388,179 @@ def plan_word_alignment(turns, transcript, duration, prepared, *, frame_rate=Non
     words, estimates, placements = prepared
     match_data = _match_alignment(turns, words)
 
-    def make_plan(words):
-        aligned, weak, coverage, matches = _timed_alignment(turns, words, match_data)
-        return aligned, weak, coverage, matches, captions(aligned, words, matches)
-
-    def invisible(cues):
-        return [(c['start'], c['end']) for c in cues
-                if not _frame_hits(c['start'], c['end'], 1, frame_rate)]
-
-    plan = make_plan(words)
+    plan = _caption_plan(turns, words, match_data)
     if not frame_rate or not placements:
         return words, estimates, plan
-    missing = invisible(plan[-1])
-    chosen = {}
-    # Try only alternative placements that can change a missing cue. Rerun the
-    # timing pass to preserve all reservations; reuse the text alignment.
-    for index, (lo, hi, options) in placements.items():
-        if not missing:
+    missing = _invisible_cues(plan[-1], frame_rate)
+    if not missing:
+        return words, estimates, plan
+    tokens = _repair_tokens(transcript, duration)
+    result = list(words)
+    amended = {}
+    hidden_index = 0
+    for a, b, left_turn, right_turn, local_matches in _repair_regions(turns, tokens, match_data):
+        while hidden_index < len(missing) and missing[hidden_index][0] < words[a][0]:
+            hidden_index += 1
+        if hidden_index == len(missing):
             break
-        if not any(a <= hi + 1e-10 and lo <= b + 1e-10 for a, b in missing):
+        if missing[hidden_index][1] > words[b - 1][1]:
             continue
-        for option in options:
-            override = chosen.copy()
-            override[index] = option
-            try:
-                candidate, records = _repair_words(transcript, duration, frame_rate, override, {})
-                candidate_words = read_words(candidate, duration)
-                candidate_plan = make_plan(candidate_words)
-                hidden = invisible(candidate_plan[-1])
-            except ValueError:
+        if not any(tokens[i][3] == tokens[i][4] for i in range(a, b)):
+            continue
+        local_words = words[a:b]
+        local_turns = turns[left_turn:right_turn]
+        local_transcript = {'segments': [{'words': [
+            dict(start=start, end=stop, word=text)
+            for (_, _, _, start, stop), (_, _, text) in zip(tokens[a:b], local_words)]}]}
+        candidate = _retry_region(local_turns, local_transcript, duration, local_matches,
+                                  local_words, frame_rate)
+        if candidate is not None:
+            result[a:b], local_records = candidate
+            for row in local_records:
+                row['segment'], row['word'] = tokens[a + row['word']][:2]
+            amended[(a, b)] = local_records
+    if not amended:
+        return words, estimates, plan
+    final_plan = _caption_plan(turns, result, match_data)
+    if not _improves_visibility(missing, _invisible_cues(final_plan[-1], frame_rate)):
+        return words, estimates, plan
+    return result, _merge_repair_records(tokens, estimates, amended), final_plan
+
+
+def _caption_plan(turns, words, match_data):
+    aligned, weak, coverage, matches = _timed_alignment(turns, words, match_data)
+    return aligned, weak, coverage, matches, captions(aligned, words, matches)
+
+
+def _invisible_cues(cues, fps):
+    return [(c['start'], c['end']) for c in cues if not _frame_hits(c['start'], c['end'], 1, fps)]
+
+
+def _improves_visibility(before, after):
+    if len(after) >= len(before):
+        return False
+    i = 0
+    for a, b in after:
+        while i < len(before) and before[i][1] <= a:
+            i += 1
+        if i == len(before) or b <= before[i][0]:
+            return False
+    return True
+
+
+def _repair_regions(turns, tokens, match_data):
+    """Cut only between stable opposite-speaker words at a clean turn boundary."""
+    parts, asr_parts, matches = match_data
+    script = list(accumulate(map(len, parts), initial=0))
+    spoken = list(accumulate(map(len, asr_parts), initial=0))
+    inverse = {value: key for key, value in matches.items()}
+    a = left_turn = 0
+    for t in range(1, len(turns) + 1):
+        if t == len(turns):
+            b = len(tokens)
+        else:
+            if turns[t - 1]['speaker'] == turns[t]['speaker']:
                 continue
-            # Do not trade a visible cue for a different invisible cue. Cue
-            # bounds can shift, so require any remaining misses to intersect
-            # a previously missing interval.
-            if len(hidden) < len(missing) and all(
-                    any(a < d and c < b for c, d in missing) for a, b in hidden):
-                words, estimates, plan = candidate_words, records, candidate_plan
-                missing, chosen = hidden, override
-                break
-    return words, estimates, plan
+            char = matches.get(script[t])
+            if char is None:
+                continue
+            b = bisect_right(spoken, char) - 1
+            if not a < b < len(tokens) or char != spoken[b] or not asr_parts[b-1] or not asr_parts[b]:
+                continue
+            _, _, _, ls, le = tokens[b-1]
+            _, _, _, rs, re = tokens[b]
+            if not ls < le <= rs < re:
+                continue
+            # Require the two boundary words to be fully contained in their
+            # turns. Neither clipping a turn nor a same-speaker merge can then
+            # make the regional caption start depend on the preceding region.
+            expected = script[t] + spoken[b-1] - char
+            if (expected < script[t-1] or script[t] + len(asr_parts[b]) > script[t+1]
+                    or any(inverse.get(j) != char + j - script[t]
+                           for j in range(expected, script[t] + len(asr_parts[b])))):
+                continue
+        local = (parts[left_turn:t], asr_parts[a:b],
+                 {j - script[left_turn]: matches[j] - spoken[a]
+                  for j in range(script[left_turn], script[t]) if j in matches})
+        yield a, b, left_turn, t, local
+        a, left_turn = b, t
+
+
+def _retry_region(turns, transcript, duration, match_data, words, fps):
+    """Search a bounded set of joint schedules without re-reading other regions."""
+    before = _invisible_cues(_caption_plan(turns, words, match_data)[-1], fps)
+    if not before:
+        return None
+    placements = {}
+    _repair_words(transcript, duration, fps, {}, placements)
+    attempts = 0
+    overrides = {}
+    best = None
+    # Rank groups by proximity, but include earlier groups sharing a donor:
+    # changing one choice recomputes all timing budgets in this region.
+    starts = [a for a, _ in before]
+
+    def distance(item):
+        lo, hi, _ = item[1]
+        i = bisect_right(starts, lo)
+        return min((max(0, a - hi, lo - b) for a, b in before[max(i - 1, 0):i + 1]), default=0)
+
+    choices = [(k, option) for k, (_, _, options) in sorted(placements.items(), key=distance)
+               for option in options]
+    for index, option in choices:
+        if attempts >= 96 or not before:
+            break
+        attempts += 1
+        candidate_overrides = {**overrides, index: option}
+        try:
+            transcript_copy, records = _repair_words(transcript, duration, fps, candidate_overrides, {})
+            candidate_words = read_words(transcript_copy, duration)
+            after = _invisible_cues(_caption_plan(turns, candidate_words, match_data)[-1], fps)
+        except ValueError:
+            continue
+        if _improves_visibility(before, after):
+            before, overrides = after, candidate_overrides
+            best = candidate_words, records
+    return best
+
+
+def _merge_repair_records(tokens, estimates, amended):
+    # Keep the original non-overlapping regions' records in their original order.
+    indices = {token[:2]: i for i, token in enumerate(tokens)}
+    regions = iter(amended.items())
+    region = next(regions, None)
+    result = []
+    for row in estimates:
+        i = indices[row['segment'], row['word']]
+        while region is not None and i >= region[0][1]:
+            result.extend(region[1])
+            region = next(regions, None)
+        if region is None or i < region[0][0]:
+            result.append(row)
+    while region is not None:
+        result.extend(region[1])
+        region = next(regions, None)
+    return result
 
 
 def _repair_words(transcript, duration, frame_rate, overrides, alternatives):
     repaired = deepcopy(transcript)
+    tokens = _repair_tokens(repaired, duration)
+
+    return _place_repair_tokens(repaired, tokens, duration, frame_rate, overrides, alternatives)
+
+
+def _repair_tokens(transcript, duration):
     tokens = []
-    for i, _, entries, _ in _segments(repaired):
+    for i, _, entries, _ in _segments(transcript):
         for j, entry in enumerate(entries):
             start, end, text = _word_fields(entry, f'segments[{i}].words[{j}]', duration)
             if text.strip():
                 tokens.append((i, j, entry, start, end))
+    return tokens
 
+
+def _place_repair_tokens(repaired, tokens, duration, frame_rate, overrides, alternatives):
     estimates, blocked = [], []
     shared_limits, end_trim = _repair_reservations(tokens, duration)
     previous = 0.0
@@ -463,10 +600,15 @@ def _repair_words(transcript, duration, frame_rate, overrides, alternatives):
                 other_left = min(deficit - other_right, left_room)
                 prefer_right = (_frame_hits(lo - other_left, hi + other_right, count, frame_rate)
                                 > _frame_hits(lo - left_take, hi + right_take, count, frame_rate))
-                if frame_rate and other_right - right_take > 1e-10:
-                    alternatives[k] = (lo - left_take, hi + other_right,
-                                       ('trim-left',) if prefer_right else ('trim-right',))
-                if placement == 'trim-right' or (placement is None and prefer_right):
+                if frame_rate and left_take - other_left > 1e-10:
+                    default_trim = other_left if prefer_right else left_take
+                    alternatives[k] = (lo - left_take, hi + other_right, tuple(
+                        x for x in _trim_splits(lo, minimum, count, other_left, left_take, frame_rate)
+                        if abs(x - default_trim) > 1e-10))
+                if isinstance(placement, float) and other_left - 1e-10 <= placement <= left_take + 1e-10:
+                    left_take = max(other_left, min(left_take, placement))
+                    right_take = max(0.0, deficit - left_take)
+                elif prefer_right:
                     left_take, right_take = other_left, other_right
                 for adjacent, edge, take in ((left, 'end', left_take), (right, 'start', right_take)):
                     if not adjacent or take <= 1e-10:
