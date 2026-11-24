@@ -5,6 +5,7 @@ import math
 import re
 import unicodedata
 from bisect import bisect_right
+from copy import deepcopy
 from difflib import SequenceMatcher
 from xml.etree import ElementTree as ET
 from zipfile import ZipFile
@@ -258,12 +259,9 @@ class IncompleteSegmentWords(ValueError):
     """The segment text and its timed words disagree."""
 
 
-def read_words(transcript, duration):
+def _segments(transcript):
     if not isinstance(transcript, dict) or not isinstance(transcript.get('segments'), list):
         raise ValueError('Expected Whisper JSON with a segments array')
-    words = []
-    previous = 0.0
-    separators = []
     for i, seg in enumerate(transcript['segments']):
         if not isinstance(seg, dict):
             raise ValueError(f'ASR segments[{i}] must be an object')
@@ -273,22 +271,88 @@ def read_words(transcript, duration):
         segment_text = seg.get('text', '')
         if not isinstance(segment_text, str):
             raise ValueError(f'ASR segments[{i}].text must be a string')
+        yield i, seg, entries, segment_text
+
+
+def _word_fields(w, location, duration):
+    if not isinstance(w, dict) or not isinstance(w.get('word'), str):
+        raise ValueError(f'ASR {location} must be an object with string word text')
+    try:
+        start, end = w['start'], w['end']
+        if type(start) not in (int, float, str) or type(end) not in (int, float, str):
+            raise ValueError('expected numeric seconds')
+        start, end = float(start), float(end)
+    except (KeyError, ValueError, OverflowError) as exc:
+        raise ValueError(f'ASR {location} requires numeric start/end timestamps') from exc
+    if (not math.isfinite(start) or not math.isfinite(end) or start < 0
+            or end > duration + .25 or end < start):
+        raise ValueError(f'ASR {location} has invalid or out-of-range word timestamps')
+    return start, end, w['word']
+
+
+def repair_zero_duration(transcript, duration):
+    """Estimate only zero-width nonblank tokens that fit between their neighbors."""
+    repaired = deepcopy(transcript)
+    tokens = []
+    for i, _, entries, _ in _segments(repaired):
+        for j, entry in enumerate(entries):
+            start, end, text = _word_fields(entry, f'segments[{i}].words[{j}]', duration)
+            if text.strip():
+                tokens.append((i, j, entry, start, end))
+
+    estimates, blocked = [], []
+    previous = 0.0
+    k = 0
+    while k < len(tokens):
+        i, j, _, start, end = tokens[k]
+        if start < end:
+            # Leave all original positive spans to the strict reader.
+            previous = max(previous, min(duration, end))
+            k += 1
+            continue
+        stop = k + 1
+        while stop < len(tokens) and tokens[stop][3] == tokens[stop][4] == start:
+            stop += 1
+        count = stop - k
+        following = min(duration, tokens[stop][3]) if stop < len(tokens) else duration
+        wanted = .10 * count
+        minimum = .02 * count
+        lo, hi = max(previous, start - wanted), min(following, start + wanted)
+        if previous <= start <= following and hi - lo >= minimum - 1e-10:
+            # Take up to 100 ms per token. Prefer the gap to the left, then
+            # the right; straddle the anchor only if neither side fits alone.
+            if start - lo >= minimum - 1e-10:
+                hi = start
+            elif hi - start >= minimum - 1e-10:
+                lo = start
+            else:
+                hi = min(hi, lo + wanted)
+            bounds = [lo + (hi - lo) * n / count for n in range(count)] + [hi]
+            for (seg, idx, entry, _, _), a, b in zip(tokens[k:stop], bounds, bounds[1:]):
+                entry['start'], entry['end'] = a, b
+                estimates.append(dict(segment=seg, word=idx, original_time=start, start=a, end=b))
+            previous = hi
+        else:
+            blocked.extend(f'segments[{seg}].words[{idx}] at {start:.6f}s'
+                           for seg, idx, _, _, _ in tokens[k:stop])
+        k = stop
+
+    if blocked:
+        sample = ', '.join(blocked[:10])
+        raise ValueError(f'Cannot estimate {len(blocked)} zero-duration ASR token(s) without '
+                         f'overlap or moving neighboring words: {sample}; correct the original timing in a copy')
+    return repaired, estimates
+
+
+def read_words(transcript, duration):
+    words = []
+    previous = 0.0
+    separators = []
+    for i, seg, entries, segment_text in _segments(transcript):
         before = len(words)
         for j, w in enumerate(entries):
             location = f'segments[{i}].words[{j}]'
-            if not isinstance(w, dict) or not isinstance(w.get('word'), str):
-                raise ValueError(f'ASR {location} must be an object with string word text')
-            text = w['word']
-            try:
-                start, end = w['start'], w['end']
-                if type(start) not in (int, float, str) or type(end) not in (int, float, str):
-                    raise ValueError('expected numeric seconds')
-                start, end = float(start), float(end)
-            except (KeyError, ValueError, OverflowError) as exc:
-                raise ValueError(f'ASR {location} requires numeric start/end timestamps') from exc
-            if (not math.isfinite(start) or not math.isfinite(end) or start < 0
-                    or end > duration + .25 or end < start):
-                raise ValueError(f'ASR {location} has invalid or out-of-range word timestamps')
+            start, end, text = _word_fields(w, location, duration)
             if not text.strip():
                 if text:
                     separators.append(text)

@@ -15,7 +15,8 @@ from xml.sax.saxutils import escape
 from zipfile import ZipFile
 
 from podcast_video_kit.__main__ import _render_window, _validate_cue_frames, duration_wav, main
-from podcast_video_kit.episode import align, align_with_provenance, captions, concept_scenes, read_words, script, srt
+from podcast_video_kit.episode import (align, align_with_provenance, captions, concept_scenes,
+                                       read_words, repair_zero_duration, script, srt)
 
 
 NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
@@ -491,6 +492,96 @@ class PlanningTests(unittest.TestCase):
             self.assertEqual(json.loads((p/'input.json').read_text()), src)
             self.assertFalse(list((p/'run').iterdir()))
 
+    def test_cli_opt_in_repairs_multiple_zero_spans_without_rewriting_raw_cache(self):
+        def word(start, end, text):
+            return dict(start=start, end=end, word=text)
+
+        src = {'segments': [dict(text='Hello', words=[word(0, .5, 'Hello')]),
+                            dict(text='Yes friend', words=[word(.8, .8, 'Yes'), word(.8, 1, ' friend')]),
+                            dict(text='See you later', words=[word(1.3, 1.3, 'See'),
+                                 word(1.3, 1.3, ' you'), word(1.3, 1.6, ' later')])]}
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            args = cli_fixture(root, ['Script', 'A: Hello', 'B: Yes friend', 'A: See you later'])
+            cache = root / 'input.json'
+            cache.write_text(json.dumps(src))
+            original = cache.read_bytes()
+            out = root / 'run'
+            model = root/'model.pt'
+            model.touch()
+
+            def fake_whisper(command):
+                folder = Path(command[command.index('--output_dir') + 1])
+                (folder/'narration.json').write_bytes(original)
+
+            with patch('podcast_video_kit.__main__.duration_wav', return_value=2), \
+                    patch('podcast_video_kit.__main__.command', side_effect=fake_whisper) as command, \
+                    contextlib.redirect_stderr(io.StringIO()) as warning:
+                options = ['--repair-zero-duration', '--plan-only']
+                self.assertEqual(main(args + options + ['--words-json', str(cache), '--output', str(out)]), 0)
+                command.assert_not_called()
+                self.assertEqual(main(args + options + ['--whisper-model', str(model),
+                                                       '--output', str(root/'generated')]), 0)
+                command.assert_called_once()
+            self.assertIn('Estimated timings for 3', warning.getvalue())
+            self.assertEqual(cache.read_bytes(), original)
+            self.assertEqual((out / 'words.json').read_bytes(), original)
+            self.assertEqual((root/'generated'/'words.json').read_bytes(), original)
+            plan = json.loads((out / 'plan.json').read_text())
+            estimates = plan['estimated_word_timings']
+            self.assertEqual([(r['segment'], r['word']) for r in estimates], [(1, 0), (2, 0), (2, 1)])
+            self.assertTrue(all(r['start'] < r['end'] for r in estimates))
+            self.assertEqual(estimates[0]['end'], .8)
+            self.assertEqual(estimates[1]['end'], estimates[2]['start'])
+            self.assertEqual(estimates[2]['end'], 1.3)
+            self.assertEqual(plan['script_character_coverage'], 1)
+            self.assertIn('See you later', (out / 'captions.srt').read_text())
+
+    def test_repair_uses_neighbor_bounds_across_segments_and_keeps_separators(self):
+        def word(start, end, text):
+            return dict(start=start, end=end, word=text)
+
+        src = {'segments': [dict(words=[word(0, .6, 'Hi'), word(.6, .6, ' there')]),
+                            dict(words=[word(.6, .6, ' '), word(.6, .6, 'again'),
+                                        word(.8, 1, ' friend'), word(1.2, 1.2, ' yes')]),
+                            dict(words=[word(1.2, 1.5, ' indeed')])]}
+        raw = json.dumps(src)
+        repaired, estimates = repair_zero_duration(src, 2)
+        words = read_words(repaired, 2)
+        self.assertEqual(json.dumps(src), raw)
+        self.assertEqual([text for _, _, text in words], ['Hi', ' there', ' again', ' friend', ' yes', ' indeed'])
+        self.assertEqual([words[j][:2] for j in (0, 3, 5)], [(0, .6), (.8, 1), (1.2, 1.5)])
+        self.assertEqual([(r['segment'], r['word']) for r in estimates], [(0, 1), (1, 1), (1, 3)])
+        self.assertEqual(words[1][0], .6)
+        self.assertEqual(words[4][1], 1.2)
+        self.assertTrue(all(a < b for a, b, _ in words))
+        self.assertTrue(all(a[1] <= b[0] for a, b in zip(words, words[1:])))
+
+    def test_repair_rejects_ambiguous_zero_spans_and_keeps_strict_checks(self):
+        def src(*times, text=None):
+            seg = dict(words=[dict(start=a, end=b, word=' Yes') for a, b in times])
+            if text is not None:
+                seg['text'] = text
+            return dict(segments=[seg])
+
+        for times in (((.1, .4), (.3, .3), (.5, .7)),
+                      ((.1, .4), (.4, .4), (.4, .7)),
+                      ((.1, .4), (.5, .5), (.45, .7)),
+                      ((.1, .4), (1.01, 1.01)),
+                      ((.1, .4), (.4001, .4001), (.401, .7))):
+            with self.subTest(times=times), self.assertRaisesRegex(ValueError, 'Cannot estimate.*words\\[1\\]'):
+                repair_zero_duration(src(*times), 1)
+        clipped, estimates = repair_zero_duration(src((.1, .4), (.38, .5)), 1)
+        self.assertFalse(estimates)
+        self.assertEqual(read_words(clipped, 1)[1][:2], (.4, .5))
+        collapsed, estimates = repair_zero_duration(src((.1, .4), (.38, .4)), 1)
+        self.assertFalse(estimates)
+        with self.assertRaisesRegex(ValueError, 'no positive duration'):
+            read_words(collapsed, 1)
+        mismatch, _ = repair_zero_duration(src((.3, .3), (.3, .5), text='Other text'), 1)
+        with self.assertRaisesRegex(ValueError, 'does not match'):
+            read_words(mismatch, 1)
+
     def test_concepts_preserve_explicit_body_and_reject_overlap(self):
         turns = [dict(start=0, end=3), dict(start=3.5, end=5)]
         item = dict(first_turn=1, last_turn=2, title='Example', body='1 → 2')
@@ -515,6 +606,29 @@ FONT = next((x for x in FONT_CANDIDATES if Path(x).is_file()), None)
 
 @unittest.skipUnless(FONT and shutil.which('ffmpeg') and shutil.which('ffprobe'), 'Needs ffmpeg and a local font')
 class MediaSmokeTest(unittest.TestCase):
+    def test_cached_zero_durations_render_a_verified_preview(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            args = cli_fixture(root, ['Script', 'A: Hello', 'B: Good morning', 'A: Goodbye friend'])
+            with wave.open(str(root/'narration.wav'), 'wb') as wav:
+                wav.setparams((1, 2, 24_000, 0, 'NONE', 'not compressed'))
+                wav.writeframes(b'\x01\x00' * 48_000)
+            for name in ('a', 'b'):
+                Image.new('RGB', (64, 80), 'green').save(root/f'{name}.png')
+            cache = root/'input.json'
+            cache.write_text(json.dumps({'segments': [dict(words=[
+                dict(start=0, end=.3, word='Hello'),
+                dict(start=.5, end=.5, word=' Good'), dict(start=.5, end=.8, word=' morning'),
+                dict(start=1.1, end=1.1, word=' Goodbye'), dict(start=1.1, end=1.5, word=' friend')])]}))
+            out = root/'preview'
+            self.assertEqual(main(args + ['--words-json', str(cache), '--repair-zero-duration',
+                                          '--font', FONT, '--preview', '2', '--output', str(out)]), 0)
+            verification = json.loads((out/'verification.json').read_text())
+            self.assertEqual(verification['decode'], 'PASS')
+            self.assertEqual(verification['frames'], 48)
+            self.assertTrue((out/'preview.mp4').is_file())
+
     def test_preview_passes_with_an_oversized_card_outside_its_window(self):
         from PIL import Image
         with tempfile.TemporaryDirectory() as temp:

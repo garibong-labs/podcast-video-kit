@@ -19,7 +19,7 @@ from xml.etree.ElementTree import ParseError
 from zipfile import BadZipFile
 
 from .episode import (align_with_provenance, captions, check_script_length,
-                      concept_scenes, read_words, script, srt)
+                      concept_scenes, read_words, repair_zero_duration, script, srt)
 
 FPS = 24
 SIZE = (1280, 720)
@@ -210,15 +210,23 @@ def build(args):
     if args.whisper_model:
         # Keep the generated cache verbatim so timing errors can be corrected and retried.
         (out / 'words.json').write_bytes(raw)
+    estimates = []
+    if args.repair_zero_duration:
+        transcript, estimates = repair_zero_duration(transcript, float(duration))
     words = read_words(transcript, float(duration))
     if args.words_json:
         (out / 'words.json').write_bytes(raw)
     aligned, weak, coverage, token_matches = align_with_provenance(turns, words)
     cues = captions(aligned, words, token_matches)
     scenes = concept_scenes(cfg, aligned)
-    json_write(out / 'plan.json', dict(duration=float(duration), script_character_coverage=coverage,
-               low_coverage_turns=weak, turns=aligned, unlabeled_paragraphs=notes,
-               captions=cues, scenes=scenes))
+    plan = dict(duration=float(duration), script_character_coverage=coverage,
+                low_coverage_turns=weak, turns=aligned, unlabeled_paragraphs=notes,
+                captions=cues, scenes=scenes)
+    if estimates:
+        plan['estimated_word_timings'] = estimates
+        print(f'Estimated timings for {len(estimates)} zero-duration ASR token(s); '
+              'review estimated_word_timings in plan.json and check playback.', file=sys.stderr)
+    json_write(out / 'plan.json', plan)
     (out / 'captions.srt').write_text(srt(cues), encoding='utf-8')
     print(f'Plan: {len(aligned)} turns, alignment coverage {coverage:.0%}, '
           f'{len(weak)} low-coverage turns, {len(notes)} unlabeled paragraphs. Review plan.json.', flush=True)
@@ -267,6 +275,8 @@ def main(argv=None):
     source = arg.add_mutually_exclusive_group(required=True)
     source.add_argument('--whisper-model', type=Path, help='Existing trusted local OpenAI Whisper checkpoint (.pt)')
     source.add_argument('--words-json', type=Path, help='Local Whisper JSON for the same WAV; reuse without inference')
+    arg.add_argument('--repair-zero-duration', action='store_true',
+                     help='Estimate zero-duration word timings only where neighboring timestamps leave room')
     arg.add_argument('--language', help='Optional Whisper language code (otherwise autodetect)')
     arg.add_argument('--font', type=Path, help='Local font; defaults to PVK_FONT or macOS Apple SD Gothic Neo')
     arg.add_argument('--config', type=Path, help='Optional local title and concept scene JSON')
