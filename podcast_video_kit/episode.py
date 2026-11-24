@@ -297,16 +297,27 @@ def _boundary_budget(token, effective_start, duration):
     return max(0.0, min(.04 - used, current_end - effective_start - max(.02, (end - start) / 2)))
 
 
-def _shared_gap_limits(tokens, duration):
-    """Work backward to reserve later zero groups' minimum free time."""
-    limits = {}
+def _repair_reservations(tokens, duration):
+    """Reserve minimum spans and any trim a positive word owes on its right."""
+    limits, end_trim = {}, {}
+    effective_starts = []
+    previous = 0.0
+    for _, _, _, start, end in tokens:
+        effective_starts.append(max(previous, start))
+        if start < end:
+            previous = max(previous, min(duration, end))
     i = len(tokens)
     while i:
         anchor = tokens[i - 1][3]
         if anchor != tokens[i - 1][4]:
             i -= 1
             continue
-        end = min(duration, tokens[i][3]) if i < len(tokens) else duration
+        free_end = end = min(duration, tokens[i][3]) if i < len(tokens) else duration
+        if i < len(tokens) and anchor <= end:
+            end += max(0.0, _boundary_budget(tokens[i], effective_starts[i], duration)
+                       - end_trim.get(i, 0.0))
+        free_limits = {}
+        free_fits = True
         has_later_group = False
         while i and tokens[i - 1][3] == tokens[i - 1][4]:
             anchor = tokens[i - 1][3]
@@ -315,9 +326,19 @@ def _shared_gap_limits(tokens, duration):
                 start -= 1
             if has_later_group and end >= anchor - 1e-10:
                 limits[start] = max(anchor, end)
-            end = min(end - .02 * (i - start), anchor)
+            free_fits &= free_end >= anchor - 1e-10
+            if has_later_group and free_fits:
+                free_limits[start] = max(anchor, free_end)
+            minimum = .02 * (i - start)
+            end = min(end - minimum, anchor)
+            free_end = min(free_end - minimum, anchor)
             has_later_group, i = True, start
-    return limits
+        left_edge = min(duration, tokens[i-1][4]) if i else 0.0
+        if free_fits and free_end >= left_edge - 1e-10:
+            limits.update(free_limits)
+        if i:
+            end_trim[i-1] = max(0.0, left_edge - end)
+    return limits, end_trim
 
 
 def _frame_hits(lo, hi, count, frame_rate):
@@ -335,6 +356,66 @@ def _frame_hits(lo, hi, count, frame_rate):
 
 def repair_zero_duration(transcript, duration, *, frame_rate=None):
     """Estimate zero-width nonblank tokens with limited neighboring boundary edits."""
+    return _repair_words(transcript, duration, frame_rate, {}, {})
+
+
+def prepare_word_timings(transcript, duration, *, repair=False, frame_rate=None):
+    """Validate word timings before alignment or an imported-cache copy."""
+    placements = {}
+    if repair:
+        repaired, estimates = _repair_words(transcript, duration, frame_rate, {}, placements)
+    else:
+        repaired, estimates = transcript, []
+    return read_words(repaired, duration), estimates, placements
+
+
+def plan_word_alignment(turns, transcript, duration, prepared, *, frame_rate=None):
+    """Align and caption validated words, refining bounded repairs for the frame grid."""
+    words, estimates, placements = prepared
+    match_data = _match_alignment(turns, words)
+
+    def make_plan(words):
+        aligned, weak, coverage, matches = _timed_alignment(turns, words, match_data)
+        return aligned, weak, coverage, matches, captions(aligned, words, matches)
+
+    def invisible(cues):
+        return [(c['start'], c['end']) for c in cues
+                if not _frame_hits(c['start'], c['end'], 1, frame_rate)]
+
+    plan = make_plan(words)
+    if not frame_rate or not placements:
+        return words, estimates, plan
+    missing = invisible(plan[-1])
+    chosen = {}
+    # Try only alternative placements that can change a missing cue. Rerun the
+    # timing pass to preserve all reservations; reuse the text alignment.
+    for index, (lo, hi, options) in placements.items():
+        if not missing:
+            break
+        if not any(a <= hi + 1e-10 and lo <= b + 1e-10 for a, b in missing):
+            continue
+        for option in options:
+            override = chosen.copy()
+            override[index] = option
+            try:
+                candidate, records = _repair_words(transcript, duration, frame_rate, override, {})
+                candidate_words = read_words(candidate, duration)
+                candidate_plan = make_plan(candidate_words)
+                hidden = invisible(candidate_plan[-1])
+            except ValueError:
+                continue
+            # Do not trade a visible cue for a different invisible cue. Cue
+            # bounds can shift, so require any remaining misses to intersect
+            # a previously missing interval.
+            if len(hidden) < len(missing) and all(
+                    any(a < d and c < b for c, d in missing) for a, b in hidden):
+                words, estimates, plan = candidate_words, records, candidate_plan
+                missing, chosen = hidden, override
+                break
+    return words, estimates, plan
+
+
+def _repair_words(transcript, duration, frame_rate, overrides, alternatives):
     repaired = deepcopy(transcript)
     tokens = []
     for i, _, entries, _ in _segments(repaired):
@@ -344,7 +425,7 @@ def repair_zero_duration(transcript, duration, *, frame_rate=None):
                 tokens.append((i, j, entry, start, end))
 
     estimates, blocked = [], []
-    shared_limits = _shared_gap_limits(tokens, duration)
+    shared_limits, end_trim = _repair_reservations(tokens, duration)
     previous = 0.0
     previous_start = 0.0
     k = 0
@@ -365,21 +446,27 @@ def repair_zero_duration(transcript, duration, *, frame_rate=None):
         minimum = .02 * count
         lo, hi = max(previous, start - wanted), min(following, start + wanted)
         deficit = minimum - (hi - lo)
+        placement = overrides.get(k)
         if previous <= start <= following and deficit > 1e-10:
             # At a cramped boundary, borrow only the missing time from the
             # adjacent positive words. Keep at least half and 20 ms of each.
             left = tokens[k - 1] if k and tokens[k - 1][3] < tokens[k - 1][4] else None
             right = tokens[stop] if stop < len(tokens) and tokens[stop][3] < tokens[stop][4] else None
             left_room = _boundary_budget(left, previous_start, duration) if left else 0.0
-            right_room = _boundary_budget(right, following, duration) if right else 0.0
+            right_room = (max(0.0, _boundary_budget(right, following, duration)
+                              - end_trim.get(stop, 0.0)) if right else 0.0)
             left_take = min(deficit, left_room)
             right_take = min(deficit - left_take, right_room)
             if left_take + right_take >= deficit - 1e-10:
                 # At equal trim cost, prefer placement on the render grid.
                 other_right = min(deficit, right_room)
                 other_left = min(deficit - other_right, left_room)
-                if (_frame_hits(lo - other_left, hi + other_right, count, frame_rate)
-                        > _frame_hits(lo - left_take, hi + right_take, count, frame_rate)):
+                prefer_right = (_frame_hits(lo - other_left, hi + other_right, count, frame_rate)
+                                > _frame_hits(lo - left_take, hi + right_take, count, frame_rate))
+                if frame_rate and other_right - right_take > 1e-10:
+                    alternatives[k] = (lo - left_take, hi + other_right,
+                                       ('trim-left',) if prefer_right else ('trim-right',))
+                if placement == 'trim-right' or (placement is None and prefer_right):
                     left_take, right_take = other_left, other_right
                 for adjacent, edge, take in ((left, 'end', left_take), (right, 'start', right_take)):
                     if not adjacent or take <= 1e-10:
@@ -399,17 +486,19 @@ def repair_zero_duration(transcript, duration, *, frame_rate=None):
         if previous <= start <= following and hi - lo >= minimum - 1e-10:
             # Take up to 100 ms per token. Prefer a usable one-sided gap,
             # using the left as the tiebreaker; otherwise straddle the anchor.
+            options = {}
             if start - lo >= minimum - 1e-10:
-                if (hi - start >= minimum - 1e-10
-                        and _frame_hits(start, hi, count, frame_rate)
-                        > _frame_hits(lo, start, count, frame_rate)):
-                    lo = start
-                else:
-                    hi = start
-            elif hi - start >= minimum - 1e-10:
-                lo = start
-            else:
-                hi = min(hi, lo + wanted)
+                options['left'] = lo, start
+            if hi - start >= minimum - 1e-10:
+                options['right'] = start, hi
+            options['span'] = lo, min(hi, lo + wanted)
+            default = max((name for name in ('left', 'right') if name in options), default='span',
+                          key=lambda name: _frame_hits(*options[name], count, frame_rate))
+            if frame_rate and deficit <= 1e-10 and lo < start < hi:
+                others = tuple(name for name in options if name != default and options[name] != options[default])
+                if others:
+                    alternatives[k] = (lo, hi, others)
+            lo, hi = options.get(placement, options[default])
             bounds = [lo + (hi - lo) * n / count for n in range(count)] + [hi]
             for (seg, idx, entry, _, _), a, b in zip(tokens[k:stop], bounds, bounds[1:]):
                 entry['start'], entry['end'] = a, b
@@ -469,21 +558,31 @@ def align(turns, words):
 
 def align_with_provenance(turns, words):
     """Also return matched character counts in ASR token order, or None for non-speech tokens."""
+    return _timed_alignment(turns, words, _match_alignment(turns, words))
+
+
+def _match_alignment(turns, words):
     # Exact matching of normalized character runs, monotonic across the episode.
-    # Character positions interpolate within ASR words; they are not phoneme times.
     parts = [normalized(t['text']) for t in turns]
     script_text = ''.join(parts)
     asr_parts = [normalized(w[2]) for w in words]
     audio_text = ''.join(asr_parts)
     _check_alignment_length(max(len(script_text), len(audio_text)))
+    matches = {}
+    for a, b, size in SequenceMatcher(None, script_text, audio_text, autojunk=False).get_matching_blocks():
+        matches.update((a+i, b+i) for i in range(size))
+    return parts, asr_parts, matches
+
+
+def _timed_alignment(turns, words, match_data):
+    # Character positions interpolate within ASR words; they are not phoneme times.
+    parts, asr_parts, matches = match_data
+    script_length = sum(map(len, parts))
     times = []
     for (a, b, _), part in zip(words, asr_parts):
         if part:
             boundaries = [a, *(a + (b-a)*i/len(part) for i in range(1, len(part))), b]
             times.extend(zip(boundaries, boundaries[1:]))
-    matches = {}
-    for a, b, size in SequenceMatcher(None, script_text, audio_text, autojunk=False).get_matching_blocks():
-        matches.update((a+i, b+i) for i in range(size))
     cursor = 0
     aligned, issues = [], []
     for index, (turn, part) in enumerate(zip(turns, parts), 1):
@@ -494,7 +593,7 @@ def align_with_provenance(turns, words):
             issues.append(index)
         aligned.append(dict(turn, coverage=ratio, start=times[hits[0]][0] if hits else None,
                             end=times[hits[-1]][1] if hits else None))
-    if not matches or len(matches)/len(script_text) < .50 or any(t['start'] is None for t in aligned):
+    if not matches or len(matches)/script_length < .50 or any(t['start'] is None for t in aligned):
         failing = ', '.join(str(i+1) for i,t in enumerate(aligned) if t['start'] is None)
         raise ValueError('Script and recording could not be reliably aligned. Check section and recording.'
                          + (f' No matches for turns: {failing}.' if failing else ''))
@@ -505,7 +604,7 @@ def align_with_provenance(turns, words):
         stop = cursor + len(part)
         token_matches.append(sum(i in audio_hits for i in range(cursor, stop)) if part else None)
         cursor = stop
-    return aligned, issues, len(matches)/len(script_text), token_matches
+    return aligned, issues, len(matches)/script_length, token_matches
 
 
 def _caption_speaker(turns, starts, start, end):

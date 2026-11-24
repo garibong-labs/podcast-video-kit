@@ -612,15 +612,17 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(sum(r.get('kind') == 'neighbor_boundary' for r in records), 2)
 
     def test_distinct_zero_groups_reserve_shared_gap(self):
-        src = dict(segments=[dict(words=[dict(start=a, end=b, word=' x') for a, b in
-                                         ((0, .40), (.40, .40), (.44, .44), (.44, .46))])])
-        repaired, records = repair_zero_duration(src, 1)
-        words = read_words(repaired, 1)
-        for actual, expected in zip(words, ((0, .40), (.40, .42), (.42, .44), (.44, .46))):
-            self.assertAlmostEqual(actual[0], expected[0])
-            self.assertAlmostEqual(actual[1], expected[1])
-        self.assertEqual(len(records), 2)
-        self.assertFalse(any(r.get('kind') == 'neighbor_boundary' for r in records))
+        for right_end in (.46, .80):
+            with self.subTest(right_end=right_end):
+                src = dict(segments=[dict(words=[dict(start=a, end=b, word=' x') for a, b in
+                                                 ((0, .40), (.40, .40), (.44, .44), (.44, right_end))])])
+                repaired, records = repair_zero_duration(src, 1)
+                words = read_words(repaired, 1)
+                for actual, expected in zip(words, ((0, .40), (.40, .42), (.42, .44), (.44, right_end))):
+                    self.assertAlmostEqual(actual[0], expected[0])
+                    self.assertAlmostEqual(actual[1], expected[1])
+                self.assertEqual(len(records), 2)
+                self.assertFalse(any(r.get('kind') == 'neighbor_boundary' for r in records))
 
     def test_repair_reports_wav_clipping_separately_from_boundary_trim(self):
         src = dict(segments=[dict(words=[dict(start=0, end=1.20, word='Hi'),
@@ -633,6 +635,24 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(change['original_end'], 1)
         self.assertEqual(change['source_end'], 1.20)
         self.assertAlmostEqual(change['original_end'] - change['end'], .02)
+
+    def test_repair_reserves_shared_gap_when_right_neighbor_can_cover_only_half(self):
+        src = dict(segments=[dict(words=[dict(start=a, end=b, word=' x') for a, b in
+                                         ((0, .40), (.40, .40), (.41, .41), (.41, .44))])])
+        repaired, _ = repair_zero_duration(src, 1)
+        for actual, (start, end) in zip(read_words(repaired, 1),
+                                       ((0, .38), (.38, .40), (.40, .42), (.42, .44))):
+            self.assertAlmostEqual(actual[0], start)
+            self.assertAlmostEqual(actual[1], end)
+
+    def test_repair_reserves_a_middle_words_budget_for_its_other_side(self):
+        src = dict(segments=[dict(words=[dict(start=a, end=b, word=' x') for a, b in
+                                         ((0, 1), (1, 1), (1, 1.06), (1.06, 1.06))])])
+        repaired, _ = repair_zero_duration(src, 1.06, frame_rate=24)
+        for actual, (start, end) in zip(read_words(repaired, 1.06),
+                                       ((0, .99), (.99, 1.01), (1.01, 1.04), (1.04, 1.06))):
+            self.assertAlmostEqual(actual[0], start)
+            self.assertAlmostEqual(actual[1], end)
 
     def test_concepts_preserve_explicit_body_and_reject_overlap(self):
         turns = [dict(start=0, end=3), dict(start=3.5, end=5)]
@@ -706,6 +726,45 @@ class MediaSmokeTest(unittest.TestCase):
             verification = json.loads((out/'verification.json').read_text())
             self.assertEqual(verification['frames'], 48)
             self.assertEqual(verification['decode'], 'PASS')
+
+    def test_repair_keeps_donating_caption_visible(self):
+        cues = self._render_caption_repair(
+            ['A: Hello there', 'B: Yes'],
+            [(0, 1, 'Hello'), (1, 1, ' there'), (1, 1.04, ' Yes')], 24960)
+        self.assertEqual([(c['start'], c['end']) for c in cues], [(0, 1), (1, 1.04)])
+
+    def test_repair_can_span_anchor_when_a_one_sided_gap_misses_frame(self):
+        cues = self._render_caption_repair(
+            ['A: Hi', 'B: Yes', 'A: Bye'],
+            [(0, .96, 'Hi'), (1, 1, ' Yes'), (1.01, 2, ' Bye')], 48000)
+        self.assertEqual(cues[0]['end'], .96)
+        self.assertEqual(cues[2]['start'], 1.01)
+        self.assertLessEqual(cues[1]['start'], 1)
+        self.assertGreater(cues[1]['end'], 1)
+
+    def _render_caption_repair(self, script_lines, entries, samples):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            args = cli_fixture(root, ['Script', *script_lines])
+            with wave.open(str(root/'narration.wav'), 'wb') as wav:
+                wav.setparams((1, 2, 24_000, 0, 'NONE', 'not compressed'))
+                wav.writeframes(b'\x01\x00' * samples)
+            for name in ('a', 'b'):
+                Image.new('RGB', (64, 80), 'green').save(root/f'{name}.png')
+            cache = root/'input.json'
+            raw = json.dumps({'segments': [dict(words=[dict(start=a, end=b, word=text)
+                                                       for a, b, text in entries])]})
+            cache.write_text(raw)
+            out = root/'full'
+            self.assertEqual(main(args + ['--words-json', str(cache), '--repair-zero-duration',
+                                          '--font', FONT, '--output', str(out)]), 0)
+            self.assertEqual(cache.read_text(), raw)
+            self.assertEqual((out/'words.json').read_text(), raw)
+            verification = json.loads((out/'verification.json').read_text())
+            self.assertEqual(verification['frames'], (samples + 999) // 1000)
+            self.assertEqual(verification['decode'], 'PASS')
+            return json.loads((out/'plan.json').read_text())['captions']
 
     def test_preview_passes_with_an_oversized_card_outside_its_window(self):
         from PIL import Image

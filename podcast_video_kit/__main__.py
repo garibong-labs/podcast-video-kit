@@ -18,8 +18,8 @@ import wave
 from xml.etree.ElementTree import ParseError
 from zipfile import BadZipFile
 
-from .episode import (align_with_provenance, captions, check_script_length,
-                      concept_scenes, read_words, repair_zero_duration, script, srt)
+from .episode import (check_script_length, concept_scenes, plan_word_alignment,
+                      prepare_word_timings, script, srt)
 
 FPS = 24
 SIZE = (1280, 720)
@@ -210,14 +210,11 @@ def build(args):
     if args.whisper_model:
         # Keep the generated cache verbatim so timing errors can be corrected and retried.
         (out / 'words.json').write_bytes(raw)
-    estimates = []
-    if args.repair_zero_duration:
-        transcript, estimates = repair_zero_duration(transcript, float(duration), frame_rate=FPS)
-    words = read_words(transcript, float(duration))
+    prepared = prepare_word_timings(transcript, float(duration), repair=args.repair_zero_duration, frame_rate=FPS)
     if args.words_json:
         (out / 'words.json').write_bytes(raw)
-    aligned, weak, coverage, token_matches = align_with_provenance(turns, words)
-    cues = captions(aligned, words, token_matches)
+    words, estimates, (aligned, weak, coverage, token_matches, cues) = plan_word_alignment(
+        turns, transcript, float(duration), prepared, frame_rate=FPS)
     scenes = concept_scenes(cfg, aligned)
     plan = dict(duration=float(duration), script_character_coverage=coverage,
                 low_coverage_turns=weak, turns=aligned, unlabeled_paragraphs=notes,
