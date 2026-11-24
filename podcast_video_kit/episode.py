@@ -5,7 +5,9 @@ import math
 import re
 import unicodedata
 from bisect import bisect_right
+from copy import deepcopy
 from difflib import SequenceMatcher
+from itertools import accumulate
 from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 
@@ -258,12 +260,9 @@ class IncompleteSegmentWords(ValueError):
     """The segment text and its timed words disagree."""
 
 
-def read_words(transcript, duration):
+def _segments(transcript):
     if not isinstance(transcript, dict) or not isinstance(transcript.get('segments'), list):
         raise ValueError('Expected Whisper JSON with a segments array')
-    words = []
-    previous = 0.0
-    separators = []
     for i, seg in enumerate(transcript['segments']):
         if not isinstance(seg, dict):
             raise ValueError(f'ASR segments[{i}] must be an object')
@@ -273,22 +272,401 @@ def read_words(transcript, duration):
         segment_text = seg.get('text', '')
         if not isinstance(segment_text, str):
             raise ValueError(f'ASR segments[{i}].text must be a string')
+        yield i, seg, entries, segment_text
+
+
+def _word_fields(w, location, duration):
+    if not isinstance(w, dict) or not isinstance(w.get('word'), str):
+        raise ValueError(f'ASR {location} must be an object with string word text')
+    try:
+        start, end = w['start'], w['end']
+        if type(start) not in (int, float, str) or type(end) not in (int, float, str):
+            raise ValueError('expected numeric seconds')
+        start, end = float(start), float(end)
+    except (KeyError, ValueError, OverflowError) as exc:
+        raise ValueError(f'ASR {location} requires numeric start/end timestamps') from exc
+    if (not math.isfinite(start) or not math.isfinite(end) or start < 0
+            or end > duration + .25 or end < start):
+        raise ValueError(f'ASR {location} has invalid or out-of-range word timestamps')
+    return start, end, w['word']
+
+
+def _boundary_budget(token, effective_start, duration):
+    _, _, entry, start, end = token
+    current_end = min(duration, float(entry['end']))
+    used = (float(entry['start']) - start) + (min(duration, end) - current_end)
+    return max(0.0, min(.04 - used, current_end - effective_start - max(.02, (end - start) / 2)))
+
+
+def _repair_reservations(tokens, duration):
+    """Reserve minimum spans and any trim a positive word owes on its right."""
+    limits, end_trim = {}, {}
+    effective_starts = []
+    previous = 0.0
+    for _, _, _, start, end in tokens:
+        effective_starts.append(max(previous, start))
+        if start < end:
+            previous = max(previous, min(duration, end))
+    i = len(tokens)
+    while i:
+        anchor = tokens[i - 1][3]
+        if anchor != tokens[i - 1][4]:
+            i -= 1
+            continue
+        free_end = end = min(duration, tokens[i][3]) if i < len(tokens) else duration
+        if i < len(tokens) and anchor <= end:
+            end += max(0.0, _boundary_budget(tokens[i], effective_starts[i], duration)
+                       - end_trim.get(i, 0.0))
+        free_limits = {}
+        free_fits = True
+        has_later_group = False
+        while i and tokens[i - 1][3] == tokens[i - 1][4]:
+            anchor = tokens[i - 1][3]
+            start = i - 1
+            while start and tokens[start - 1][3] == tokens[start - 1][4] == anchor:
+                start -= 1
+            if has_later_group and end >= anchor - 1e-10:
+                limits[start] = max(anchor, end)
+            free_fits &= free_end >= anchor - 1e-10
+            if has_later_group and free_fits:
+                free_limits[start] = max(anchor, free_end)
+            minimum = .02 * (i - start)
+            end = min(end - minimum, anchor)
+            free_end = min(free_end - minimum, anchor)
+            has_later_group, i = True, start
+        left_edge = min(duration, tokens[i-1][4]) if i else 0.0
+        if free_fits and free_end >= left_edge - 1e-10:
+            limits.update(free_limits)
+        if i:
+            end_trim[i-1] = max(0.0, left_edge - end)
+    return limits, end_trim
+
+
+def _frame_hits(lo, hi, count, frame_rate):
+    if not frame_rate:
+        return 0
+    edges = [lo + (hi - lo) * n / count for n in range(count)] + [hi]
+    hits = 0
+    for a, b in zip(edges, edges[1:]):
+        frame = math.floor(a * frame_rate)
+        if frame / frame_rate < a:
+            frame += 1
+        hits += frame / frame_rate < b
+    return hits
+
+
+def _trim_splits(lo, width, count, low, high, fps):
+    """Try both endpoints and each open interval between frame crossings."""
+    cuts = {low, high}
+    for i in range(count + 1):
+        edge = lo + i * width / count
+        for n in range(math.ceil((edge - high) * fps), math.floor((edge - low) * fps) + 1):
+            cut = edge - n / fps
+            if low < cut < high:
+                cuts.add(cut)
+    edges = sorted(cuts)
+    return tuple(edges + [(a + b) / 2 for a, b in zip(edges, edges[1:]) if b - a > 1e-10])
+
+
+def repair_zero_duration(transcript, duration, *, frame_rate=None):
+    """Estimate zero-width nonblank tokens with limited neighboring boundary edits."""
+    return _repair_words(transcript, duration, frame_rate, {}, {})
+
+
+def prepare_word_timings(transcript, duration, *, repair=False, frame_rate=None):
+    """Validate word timings before alignment or an imported-cache copy."""
+    placements = {}
+    if repair:
+        repaired, estimates = _repair_words(transcript, duration, frame_rate, {}, placements)
+    else:
+        repaired, estimates = transcript, []
+    return read_words(repaired, duration), estimates, placements
+
+
+def plan_word_alignment(turns, transcript, duration, prepared, *, frame_rate=None):
+    """Align and caption validated words, refining bounded repairs for the frame grid."""
+    words, estimates, placements = prepared
+    match_data = _match_alignment(turns, words)
+
+    plan = _caption_plan(turns, words, match_data)
+    if not frame_rate or not placements:
+        return words, estimates, plan
+    missing = _invisible_cues(plan[-1], frame_rate)
+    if not missing:
+        return words, estimates, plan
+    tokens = _repair_tokens(transcript, duration)
+    result = list(words)
+    amended = {}
+    hidden_index = 0
+    for a, b, left_turn, right_turn, local_matches in _repair_regions(turns, tokens, match_data):
+        while hidden_index < len(missing) and missing[hidden_index][0] < words[a][0]:
+            hidden_index += 1
+        if hidden_index == len(missing):
+            break
+        if missing[hidden_index][1] > words[b - 1][1]:
+            continue
+        if not any(tokens[i][3] == tokens[i][4] for i in range(a, b)):
+            continue
+        local_words = words[a:b]
+        local_turns = turns[left_turn:right_turn]
+        local_transcript = {'segments': [{'words': [
+            dict(start=start, end=stop, word=text)
+            for (_, _, _, start, stop), (_, _, text) in zip(tokens[a:b], local_words)]}]}
+        candidate = _retry_region(local_turns, local_transcript, duration, local_matches,
+                                  local_words, frame_rate)
+        if candidate is not None:
+            result[a:b], local_records = candidate
+            for row in local_records:
+                row['segment'], row['word'] = tokens[a + row['word']][:2]
+            amended[(a, b)] = local_records
+    if not amended:
+        return words, estimates, plan
+    final_plan = _caption_plan(turns, result, match_data)
+    if not _improves_visibility(missing, _invisible_cues(final_plan[-1], frame_rate)):
+        return words, estimates, plan
+    return result, _merge_repair_records(tokens, estimates, amended), final_plan
+
+
+def _caption_plan(turns, words, match_data):
+    aligned, weak, coverage, matches = _timed_alignment(turns, words, match_data)
+    return aligned, weak, coverage, matches, captions(aligned, words, matches)
+
+
+def _invisible_cues(cues, fps):
+    return [(c['start'], c['end']) for c in cues if not _frame_hits(c['start'], c['end'], 1, fps)]
+
+
+def _improves_visibility(before, after):
+    if len(after) >= len(before):
+        return False
+    i = 0
+    for a, b in after:
+        while i < len(before) and before[i][1] <= a:
+            i += 1
+        if i == len(before) or b <= before[i][0]:
+            return False
+    return True
+
+
+def _repair_regions(turns, tokens, match_data):
+    """Cut only between stable opposite-speaker words at a clean turn boundary."""
+    parts, asr_parts, matches = match_data
+    script = list(accumulate(map(len, parts), initial=0))
+    spoken = list(accumulate(map(len, asr_parts), initial=0))
+    inverse = {value: key for key, value in matches.items()}
+    a = left_turn = 0
+    for t in range(1, len(turns) + 1):
+        if t == len(turns):
+            b = len(tokens)
+        else:
+            if turns[t - 1]['speaker'] == turns[t]['speaker']:
+                continue
+            char = matches.get(script[t])
+            if char is None:
+                continue
+            b = bisect_right(spoken, char) - 1
+            if not a < b < len(tokens) or char != spoken[b] or not asr_parts[b-1] or not asr_parts[b]:
+                continue
+            _, _, _, ls, le = tokens[b-1]
+            _, _, _, rs, re = tokens[b]
+            if not ls < le <= rs < re:
+                continue
+            # Require the two boundary words to be fully contained in their
+            # turns. Neither clipping a turn nor a same-speaker merge can then
+            # make the regional caption start depend on the preceding region.
+            expected = script[t] + spoken[b-1] - char
+            if (expected < script[t-1] or script[t] + len(asr_parts[b]) > script[t+1]
+                    or any(inverse.get(j) != char + j - script[t]
+                           for j in range(expected, script[t] + len(asr_parts[b])))):
+                continue
+        local = (parts[left_turn:t], asr_parts[a:b],
+                 {j - script[left_turn]: matches[j] - spoken[a]
+                  for j in range(script[left_turn], script[t]) if j in matches})
+        yield a, b, left_turn, t, local
+        a, left_turn = b, t
+
+
+def _retry_region(turns, transcript, duration, match_data, words, fps):
+    """Search a bounded set of joint schedules without re-reading other regions."""
+    before = _invisible_cues(_caption_plan(turns, words, match_data)[-1], fps)
+    if not before:
+        return None
+    placements = {}
+    _repair_words(transcript, duration, fps, {}, placements)
+    attempts = 0
+    overrides = {}
+    best = None
+    # Rank groups by proximity, but include earlier groups sharing a donor:
+    # changing one choice recomputes all timing budgets in this region.
+    starts = [a for a, _ in before]
+
+    def distance(item):
+        lo, hi, _ = item[1]
+        i = bisect_right(starts, lo)
+        return min((max(0, a - hi, lo - b) for a, b in before[max(i - 1, 0):i + 1]), default=0)
+
+    choices = [(k, option) for k, (_, _, options) in sorted(placements.items(), key=distance)
+               for option in options]
+    for index, option in choices:
+        if attempts >= 96 or not before:
+            break
+        attempts += 1
+        candidate_overrides = {**overrides, index: option}
+        try:
+            transcript_copy, records = _repair_words(transcript, duration, fps, candidate_overrides, {})
+            candidate_words = read_words(transcript_copy, duration)
+            after = _invisible_cues(_caption_plan(turns, candidate_words, match_data)[-1], fps)
+        except ValueError:
+            continue
+        if _improves_visibility(before, after):
+            before, overrides = after, candidate_overrides
+            best = candidate_words, records
+    return best
+
+
+def _merge_repair_records(tokens, estimates, amended):
+    # Keep the original non-overlapping regions' records in their original order.
+    indices = {token[:2]: i for i, token in enumerate(tokens)}
+    regions = iter(amended.items())
+    region = next(regions, None)
+    result = []
+    for row in estimates:
+        i = indices[row['segment'], row['word']]
+        while region is not None and i >= region[0][1]:
+            result.extend(region[1])
+            region = next(regions, None)
+        if region is None or i < region[0][0]:
+            result.append(row)
+    while region is not None:
+        result.extend(region[1])
+        region = next(regions, None)
+    return result
+
+
+def _repair_words(transcript, duration, frame_rate, overrides, alternatives):
+    repaired = deepcopy(transcript)
+    tokens = _repair_tokens(repaired, duration)
+
+    return _place_repair_tokens(repaired, tokens, duration, frame_rate, overrides, alternatives)
+
+
+def _repair_tokens(transcript, duration):
+    tokens = []
+    for i, _, entries, _ in _segments(transcript):
+        for j, entry in enumerate(entries):
+            start, end, text = _word_fields(entry, f'segments[{i}].words[{j}]', duration)
+            if text.strip():
+                tokens.append((i, j, entry, start, end))
+    return tokens
+
+
+def _place_repair_tokens(repaired, tokens, duration, frame_rate, overrides, alternatives):
+    estimates, blocked = [], []
+    shared_limits, end_trim = _repair_reservations(tokens, duration)
+    previous = 0.0
+    previous_start = 0.0
+    k = 0
+    while k < len(tokens):
+        _, _, token, start, end = tokens[k]
+        if start < end:
+            previous_start = max(previous, float(token['start']))
+            previous = max(previous, min(duration, end))
+            k += 1
+            continue
+        stop = k + 1
+        while stop < len(tokens) and tokens[stop][3] == tokens[stop][4] == start:
+            stop += 1
+        count = stop - k
+        following = min(duration, tokens[stop][3]) if stop < len(tokens) else duration
+        following = min(following, shared_limits.get(k, following))
+        wanted = .10 * count
+        minimum = .02 * count
+        lo, hi = max(previous, start - wanted), min(following, start + wanted)
+        deficit = minimum - (hi - lo)
+        placement = overrides.get(k)
+        if previous <= start <= following and deficit > 1e-10:
+            # At a cramped boundary, borrow only the missing time from the
+            # adjacent positive words. Keep at least half and 20 ms of each.
+            left = tokens[k - 1] if k and tokens[k - 1][3] < tokens[k - 1][4] else None
+            right = tokens[stop] if stop < len(tokens) and tokens[stop][3] < tokens[stop][4] else None
+            left_room = _boundary_budget(left, previous_start, duration) if left else 0.0
+            right_room = (max(0.0, _boundary_budget(right, following, duration)
+                              - end_trim.get(stop, 0.0)) if right else 0.0)
+            left_take = min(deficit, left_room)
+            right_take = min(deficit - left_take, right_room)
+            if left_take + right_take >= deficit - 1e-10:
+                # At equal trim cost, prefer placement on the render grid.
+                other_right = min(deficit, right_room)
+                other_left = min(deficit - other_right, left_room)
+                prefer_right = (_frame_hits(lo - other_left, hi + other_right, count, frame_rate)
+                                > _frame_hits(lo - left_take, hi + right_take, count, frame_rate))
+                if frame_rate and left_take - other_left > 1e-10:
+                    default_trim = other_left if prefer_right else left_take
+                    alternatives[k] = (lo - left_take, hi + other_right, tuple(
+                        x for x in _trim_splits(lo, minimum, count, other_left, left_take, frame_rate)
+                        if abs(x - default_trim) > 1e-10))
+                if isinstance(placement, float) and other_left - 1e-10 <= placement <= left_take + 1e-10:
+                    left_take = max(other_left, min(left_take, placement))
+                    right_take = max(0.0, deficit - left_take)
+                elif prefer_right:
+                    left_take, right_take = other_left, other_right
+                for adjacent, edge, take in ((left, 'end', left_take), (right, 'start', right_take)):
+                    if not adjacent or take <= 1e-10:
+                        continue
+                    seg, idx, entry, _, _ = adjacent
+                    a, source_end = float(entry['start']), float(entry['end'])
+                    b = min(duration, source_end)
+                    boundary = lo - take if edge == 'end' else hi + take
+                    entry[edge] = boundary
+                    record = dict(kind='neighbor_boundary', segment=seg, word=idx,
+                                  original_start=a, original_end=b,
+                                  start=float(entry['start']), end=min(duration, float(entry['end'])))
+                    if source_end != b:
+                        record['source_end'] = source_end
+                    estimates.append(record)
+                lo, hi = lo - left_take, hi + right_take
+        if previous <= start <= following and hi - lo >= minimum - 1e-10:
+            # Take up to 100 ms per token. Prefer a usable one-sided gap,
+            # using the left as the tiebreaker; otherwise straddle the anchor.
+            options = {}
+            if start - lo >= minimum - 1e-10:
+                options['left'] = lo, start
+            if hi - start >= minimum - 1e-10:
+                options['right'] = start, hi
+            options['span'] = lo, min(hi, lo + wanted)
+            default = max((name for name in ('left', 'right') if name in options), default='span',
+                          key=lambda name: _frame_hits(*options[name], count, frame_rate))
+            if frame_rate and deficit <= 1e-10 and lo < start < hi:
+                others = tuple(name for name in options if name != default and options[name] != options[default])
+                if others:
+                    alternatives[k] = (lo, hi, others)
+            lo, hi = options.get(placement, options[default])
+            bounds = [lo + (hi - lo) * n / count for n in range(count)] + [hi]
+            for (seg, idx, entry, _, _), a, b in zip(tokens[k:stop], bounds, bounds[1:]):
+                entry['start'], entry['end'] = a, b
+                estimates.append(dict(segment=seg, word=idx, original_time=start, start=a, end=b))
+            previous = hi
+        else:
+            blocked.extend(f'segments[{seg}].words[{idx}] at {start:.6f}s'
+                           for seg, idx, _, _, _ in tokens[k:stop])
+        k = stop
+
+    if blocked:
+        sample = ', '.join(blocked[:10])
+        raise ValueError(f'Cannot estimate {len(blocked)} zero-duration ASR token(s) within '
+                         f'neighboring timing limits: {sample}; correct the original timing in a copy')
+    return repaired, estimates
+
+
+def read_words(transcript, duration):
+    words = []
+    previous = 0.0
+    separators = []
+    for i, seg, entries, segment_text in _segments(transcript):
         before = len(words)
         for j, w in enumerate(entries):
             location = f'segments[{i}].words[{j}]'
-            if not isinstance(w, dict) or not isinstance(w.get('word'), str):
-                raise ValueError(f'ASR {location} must be an object with string word text')
-            text = w['word']
-            try:
-                start, end = w['start'], w['end']
-                if type(start) not in (int, float, str) or type(end) not in (int, float, str):
-                    raise ValueError('expected numeric seconds')
-                start, end = float(start), float(end)
-            except (KeyError, ValueError, OverflowError) as exc:
-                raise ValueError(f'ASR {location} requires numeric start/end timestamps') from exc
-            if (not math.isfinite(start) or not math.isfinite(end) or start < 0
-                    or end > duration + .25 or end < start):
-                raise ValueError(f'ASR {location} has invalid or out-of-range word timestamps')
+            start, end, text = _word_fields(w, location, duration)
             if not text.strip():
                 if text:
                     separators.append(text)
@@ -322,21 +700,31 @@ def align(turns, words):
 
 def align_with_provenance(turns, words):
     """Also return matched character counts in ASR token order, or None for non-speech tokens."""
+    return _timed_alignment(turns, words, _match_alignment(turns, words))
+
+
+def _match_alignment(turns, words):
     # Exact matching of normalized character runs, monotonic across the episode.
-    # Character positions interpolate within ASR words; they are not phoneme times.
     parts = [normalized(t['text']) for t in turns]
     script_text = ''.join(parts)
     asr_parts = [normalized(w[2]) for w in words]
     audio_text = ''.join(asr_parts)
     _check_alignment_length(max(len(script_text), len(audio_text)))
+    matches = {}
+    for a, b, size in SequenceMatcher(None, script_text, audio_text, autojunk=False).get_matching_blocks():
+        matches.update((a+i, b+i) for i in range(size))
+    return parts, asr_parts, matches
+
+
+def _timed_alignment(turns, words, match_data):
+    # Character positions interpolate within ASR words; they are not phoneme times.
+    parts, asr_parts, matches = match_data
+    script_length = sum(map(len, parts))
     times = []
     for (a, b, _), part in zip(words, asr_parts):
         if part:
             boundaries = [a, *(a + (b-a)*i/len(part) for i in range(1, len(part))), b]
             times.extend(zip(boundaries, boundaries[1:]))
-    matches = {}
-    for a, b, size in SequenceMatcher(None, script_text, audio_text, autojunk=False).get_matching_blocks():
-        matches.update((a+i, b+i) for i in range(size))
     cursor = 0
     aligned, issues = [], []
     for index, (turn, part) in enumerate(zip(turns, parts), 1):
@@ -347,7 +735,7 @@ def align_with_provenance(turns, words):
             issues.append(index)
         aligned.append(dict(turn, coverage=ratio, start=times[hits[0]][0] if hits else None,
                             end=times[hits[-1]][1] if hits else None))
-    if not matches or len(matches)/len(script_text) < .50 or any(t['start'] is None for t in aligned):
+    if not matches or len(matches)/script_length < .50 or any(t['start'] is None for t in aligned):
         failing = ', '.join(str(i+1) for i,t in enumerate(aligned) if t['start'] is None)
         raise ValueError('Script and recording could not be reliably aligned. Check section and recording.'
                          + (f' No matches for turns: {failing}.' if failing else ''))
@@ -358,7 +746,7 @@ def align_with_provenance(turns, words):
         stop = cursor + len(part)
         token_matches.append(sum(i in audio_hits for i in range(cursor, stop)) if part else None)
         cursor = stop
-    return aligned, issues, len(matches)/len(script_text), token_matches
+    return aligned, issues, len(matches)/script_length, token_matches
 
 
 def _caption_speaker(turns, starts, start, end):

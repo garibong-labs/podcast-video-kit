@@ -16,7 +16,9 @@ from xml.sax.saxutils import escape
 from zipfile import ZipFile
 
 from podcast_video_kit.__main__ import _render_window, _validate_cue_frames, duration_wav, main
-from podcast_video_kit.episode import align, align_with_provenance, captions, concept_scenes, read_words, script, srt
+from podcast_video_kit import episode
+from podcast_video_kit.episode import (align, align_with_provenance, captions, concept_scenes,
+                                       read_words, repair_zero_duration, script, srt)
 
 
 NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
@@ -492,6 +494,191 @@ class PlanningTests(unittest.TestCase):
             self.assertEqual(json.loads((p/'input.json').read_text()), src)
             self.assertFalse(list((p/'run').iterdir()))
 
+    def test_cli_opt_in_repairs_multiple_zero_spans_without_rewriting_raw_cache(self):
+        def word(start, end, text):
+            return dict(start=start, end=end, word=text)
+
+        src = {'segments': [dict(text='Hello', words=[word(0, .5, 'Hello')]),
+                            dict(text='Yes friend', words=[word(.8, .8, 'Yes'), word(.8, 1, ' friend')]),
+                            dict(text='See you later', words=[word(1.3, 1.3, 'See'),
+                                 word(1.3, 1.3, ' you'), word(1.3, 1.6, ' later')])]}
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            args = cli_fixture(root, ['Script', 'A: Hello', 'B: Yes friend', 'A: See you later'])
+            cache = root / 'input.json'
+            cache.write_text(json.dumps(src))
+            original = cache.read_bytes()
+            out = root / 'run'
+            model = root/'model.pt'
+            model.touch()
+
+            def fake_whisper(command):
+                folder = Path(command[command.index('--output_dir') + 1])
+                (folder/'narration.json').write_bytes(original)
+
+            with patch('podcast_video_kit.__main__.duration_wav', return_value=2), \
+                    patch('podcast_video_kit.__main__.command', side_effect=fake_whisper) as command, \
+                    contextlib.redirect_stderr(io.StringIO()) as warning:
+                options = ['--repair-zero-duration', '--plan-only']
+                self.assertEqual(main(args + options + ['--words-json', str(cache), '--output', str(out)]), 0)
+                command.assert_not_called()
+                self.assertEqual(main(args + options + ['--whisper-model', str(model),
+                                                       '--output', str(root/'generated')]), 0)
+                command.assert_called_once()
+            self.assertIn('Estimated timings for 3', warning.getvalue())
+            self.assertEqual(cache.read_bytes(), original)
+            self.assertEqual((out / 'words.json').read_bytes(), original)
+            self.assertEqual((root/'generated'/'words.json').read_bytes(), original)
+            plan = json.loads((out / 'plan.json').read_text())
+            estimates = plan['estimated_word_timings']
+            self.assertEqual([(r['segment'], r['word']) for r in estimates], [(1, 0), (2, 0), (2, 1)])
+            self.assertTrue(all(r['start'] < r['end'] for r in estimates))
+            self.assertEqual(estimates[0]['end'], .8)
+            self.assertEqual(estimates[1]['end'], estimates[2]['start'])
+            self.assertEqual(estimates[2]['end'], 1.3)
+            self.assertEqual(plan['script_character_coverage'], 1)
+            self.assertIn('See you later', (out / 'captions.srt').read_text())
+
+    def test_repair_uses_neighbor_bounds_across_segments_and_keeps_separators(self):
+        def word(start, end, text):
+            return dict(start=start, end=end, word=text)
+
+        src = {'segments': [dict(words=[word(0, .6, 'Hi'), word(.6, .6, ' there')]),
+                            dict(words=[word(.6, .6, ' '), word(.6, .6, 'again'),
+                                        word(.8, 1, ' friend'), word(1.2, 1.2, ' yes')]),
+                            dict(words=[word(1.2, 1.5, ' indeed')])]}
+        raw = json.dumps(src)
+        repaired, estimates = repair_zero_duration(src, 2)
+        words = read_words(repaired, 2)
+        self.assertEqual(json.dumps(src), raw)
+        self.assertEqual([text for _, _, text in words], ['Hi', ' there', ' again', ' friend', ' yes', ' indeed'])
+        self.assertEqual([words[j][:2] for j in (0, 3, 5)], [(0, .6), (.8, 1), (1.2, 1.5)])
+        self.assertEqual([(r['segment'], r['word']) for r in estimates], [(0, 1), (1, 1), (1, 3)])
+        self.assertEqual(words[1][0], .6)
+        self.assertEqual(words[4][1], 1.2)
+        self.assertTrue(all(a < b for a, b, _ in words))
+        self.assertTrue(all(a[1] <= b[0] for a, b in zip(words, words[1:])))
+
+    def test_repair_rejects_ambiguous_zero_spans_and_keeps_strict_checks(self):
+        def src(*times, text=None):
+            seg = dict(words=[dict(start=a, end=b, word=' Yes') for a, b in times])
+            if text is not None:
+                seg['text'] = text
+            return dict(segments=[seg])
+
+        for times in (((.1, .4), (.3, .3), (.5, .7)),
+                      ((.39, .4), (.4, .4), (.4, .41)),
+                      ((.1, .4), (.5, .5), (.45, .7)),
+                      ((.1, .4), (1.01, 1.01)),
+                      ((.39, .4), (.4001, .4001), (.401, .411))):
+            with self.subTest(times=times), self.assertRaisesRegex(ValueError, 'Cannot estimate.*words\\[1\\]'):
+                repair_zero_duration(src(*times), 1)
+        clipped, estimates = repair_zero_duration(src((.1, .4), (.38, .5)), 1)
+        self.assertFalse(estimates)
+        self.assertEqual(read_words(clipped, 1)[1][:2], (.4, .5))
+        collapsed, estimates = repair_zero_duration(src((.1, .4), (.38, .4)), 1)
+        self.assertFalse(estimates)
+        with self.assertRaisesRegex(ValueError, 'no positive duration'):
+            read_words(collapsed, 1)
+        mismatch, _ = repair_zero_duration(src((.3, .3), (.3, .5), text='Other text'), 1)
+        with self.assertRaisesRegex(ValueError, 'does not match'):
+            read_words(mismatch, 1)
+
+    def test_repair_can_trim_touching_neighbors_without_rewriting_original(self):
+        def word(start, end, text):
+            return dict(start=start, end=end, word=text)
+
+        src = {'segments': [dict(words=[word(0, .1, 'Hi'), word(.1, .1, ' there')]),
+                            dict(words=[word(.1, .25, ' friend'), word(.25, .25, ' and'),
+                                        word(.25, .25, ' then'), word(.25, .29, ' goodbye')])]}
+        original = json.dumps(src)
+        repaired, records = repair_zero_duration(src, 1)
+        self.assertEqual(json.dumps(src), original)
+        words = read_words(repaired, 1)
+        self.assertEqual([text for _, _, text in words], ['Hi', ' there', ' friend', ' and', ' then', ' goodbye'])
+        self.assertTrue(all(a < b for a, b, _ in words))
+        self.assertTrue(all(a[1] <= b[0] for a, b in zip(words, words[1:])))
+        self.assertAlmostEqual(words[0][1], .08)
+        self.assertAlmostEqual(words[2][1], .21)
+        self.assertEqual(words[-1][:2], (.25, .29))
+        neighbors = [item for item in records if item.get('kind') == 'neighbor_boundary']
+        self.assertEqual([(item['segment'], item['word']) for item in neighbors], [(0, 0), (1, 0)])
+
+    def test_repair_can_share_boundary_budget_between_both_neighbors(self):
+        words = [dict(start=a, end=b, word=' x') for a, b in ((.16, .2), (.2, .2), (.2, .2), (.2, .24))]
+        repaired, records = repair_zero_duration(dict(segments=[dict(words=words)]), 1)
+        times = [(a, b) for a, b, _ in read_words(repaired, 1)]
+        for actual, expected in zip(times, ((.16, .18), (.18, .2), (.2, .22), (.22, .24))):
+            for a, b in zip(actual, expected):
+                self.assertAlmostEqual(a, b)
+        self.assertEqual(sum(r.get('kind') == 'neighbor_boundary' for r in records), 2)
+
+    def test_distinct_zero_groups_reserve_shared_gap(self):
+        for right_end in (.46, .80):
+            with self.subTest(right_end=right_end):
+                src = dict(segments=[dict(words=[dict(start=a, end=b, word=' x') for a, b in
+                                                 ((0, .40), (.40, .40), (.44, .44), (.44, right_end))])])
+                repaired, records = repair_zero_duration(src, 1)
+                words = read_words(repaired, 1)
+                for actual, expected in zip(words, ((0, .40), (.40, .42), (.42, .44), (.44, right_end))):
+                    self.assertAlmostEqual(actual[0], expected[0])
+                    self.assertAlmostEqual(actual[1], expected[1])
+                self.assertEqual(len(records), 2)
+                self.assertFalse(any(r.get('kind') == 'neighbor_boundary' for r in records))
+
+    def test_repair_reports_wav_clipping_separately_from_boundary_trim(self):
+        src = dict(segments=[dict(words=[dict(start=0, end=1.20, word='Hi'),
+                                         dict(start=1, end=1, word=' Yes')])])
+        raw = json.dumps(src)
+        repaired, records = repair_zero_duration(src, 1)
+        self.assertEqual(json.dumps(src), raw)
+        self.assertEqual(read_words(repaired, 1)[1][:2], (.98, 1))
+        change = next(r for r in records if r.get('kind') == 'neighbor_boundary')
+        self.assertEqual(change['original_end'], 1)
+        self.assertEqual(change['source_end'], 1.20)
+        self.assertAlmostEqual(change['original_end'] - change['end'], .02)
+
+    def test_repair_reserves_shared_gap_when_right_neighbor_can_cover_only_half(self):
+        src = dict(segments=[dict(words=[dict(start=a, end=b, word=' x') for a, b in
+                                         ((0, .40), (.40, .40), (.41, .41), (.41, .44))])])
+        repaired, _ = repair_zero_duration(src, 1)
+        for actual, (start, end) in zip(read_words(repaired, 1),
+                                       ((0, .38), (.38, .40), (.40, .42), (.42, .44))):
+            self.assertAlmostEqual(actual[0], start)
+            self.assertAlmostEqual(actual[1], end)
+
+    def test_repair_reserves_a_middle_words_budget_for_its_other_side(self):
+        src = dict(segments=[dict(words=[dict(start=a, end=b, word=' x') for a, b in
+                                         ((0, 1), (1, 1), (1, 1.06), (1.06, 1.06))])])
+        repaired, _ = repair_zero_duration(src, 1.06, frame_rate=24)
+        for actual, (start, end) in zip(read_words(repaired, 1.06),
+                                       ((0, .99), (.99, 1.01), (1.01, 1.04), (1.04, 1.06))):
+            self.assertAlmostEqual(actual[0], start)
+            self.assertAlmostEqual(actual[1], end)
+
+    def test_caption_repair_work_scales_with_independent_regions(self):
+        def measure(count):
+            turns, rows = [], []
+            for i in range(count):
+                offset = 2 * i
+                greeting, answer = f'Hello{i}', f'Yes{i}'
+                turns.extend([dict(speaker='A', text=f'{greeting} there'), dict(speaker='B', text=answer)])
+                rows.extend(dict(start=offset+a, end=offset+b, word=text) for a, b, text in
+                            ((0, 1, f' {greeting}'), (1, 1, ' there'), (1, 1.04, f' {answer}')))
+            source = {'segments': [{'words': rows}]}
+            with patch.object(episode, '_repair_words', wraps=episode._repair_words) as repair:
+                prepared = episode.prepare_word_timings(source, 2 * count, repair=True, frame_rate=24)
+                _, _, (*_, cues) = episode.plan_word_alignment(turns, source, 2 * count, prepared, frame_rate=24)
+            sizes = [sum(len(seg['words']) for seg in call.args[0]['segments']) for call in repair.call_args_list]
+            self.assertEqual(len(cues), 2 * count)
+            _validate_cue_frames(cues, 0, 48 * count, Fraction(0), Fraction(2 * count))
+            self.assertEqual(sizes.count(len(rows)), 1)
+            return sum(sizes)
+
+        small = measure(8)
+        large = measure(32)
+        self.assertLessEqual(large, 5 * small)
+
     def test_concepts_preserve_explicit_body_and_reject_overlap(self):
         turns = [dict(start=0, end=3), dict(start=3.5, end=5)]
         item = dict(first_turn=1, last_turn=2, title='Example', body='1 → 2')
@@ -516,6 +703,110 @@ FONT = next((x for x in FONT_CANDIDATES if Path(x).is_file()), None)
 
 @unittest.skipUnless(FONT and shutil.which('ffmpeg') and shutil.which('ffprobe'), 'Needs ffmpeg and a local font')
 class MediaSmokeTest(unittest.TestCase):
+    def test_cached_zero_durations_render_a_verified_preview(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            args = cli_fixture(root, ['Script', 'A: Hello', 'B: Good morning', 'A: Goodbye friend'])
+            with wave.open(str(root/'narration.wav'), 'wb') as wav:
+                wav.setparams((1, 2, 24_000, 0, 'NONE', 'not compressed'))
+                wav.writeframes(b'\x01\x00' * 48_000)
+            for name in ('a', 'b'):
+                Image.new('RGB', (64, 80), 'green').save(root/f'{name}.png')
+            cache = root/'input.json'
+            cache.write_text(json.dumps({'segments': [dict(words=[
+                dict(start=0, end=.5, word='Hello'),
+                dict(start=.5, end=.5, word=' Good'), dict(start=.5, end=1.1, word=' morning'),
+                dict(start=1.1, end=1.1, word=' Goodbye'), dict(start=1.1, end=1.5, word=' friend')])]}))
+            out = root/'preview'
+            self.assertEqual(main(args + ['--words-json', str(cache), '--repair-zero-duration',
+                                          '--font', FONT, '--preview', '2', '--output', str(out)]), 0)
+            verification = json.loads((out/'verification.json').read_text())
+            self.assertEqual(verification['decode'], 'PASS')
+            self.assertEqual(verification['frames'], 48)
+            plan = json.loads((out/'plan.json').read_text())
+            self.assertEqual(sum(r.get('kind') == 'neighbor_boundary'
+                                 for r in plan['estimated_word_timings']), 2)
+            self.assertTrue((out/'preview.mp4').is_file())
+
+    def test_standalone_repaired_caption_prefers_a_visible_frame(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            args = cli_fixture(root, ['Script', 'A: Hi', 'B: Yes', 'A: Bye'])
+            with wave.open(str(root/'narration.wav'), 'wb') as wav:
+                wav.setparams((1, 2, 24_000, 0, 'NONE', 'not compressed'))
+                wav.writeframes(b'\x01\x00' * 48_000)
+            for name in ('a', 'b'):
+                Image.new('RGB', (64, 80), 'green').save(root/f'{name}.png')
+            cache = root/'input.json'
+            cache.write_text(json.dumps({'segments': [dict(words=[
+                dict(start=0, end=1, word='Hi'), dict(start=1, end=1, word=' Yes'),
+                dict(start=1, end=2, word=' Bye')])]}))
+            out = root/'preview'
+            self.assertEqual(main(args + ['--words-json', str(cache), '--repair-zero-duration',
+                                          '--font', FONT, '--preview', '2', '--output', str(out)]), 0)
+            plan = json.loads((out/'plan.json').read_text())
+            self.assertEqual(plan['captions'][1], dict(start=1, end=1.02, speaker='B', text='Yes'))
+            verification = json.loads((out/'verification.json').read_text())
+            self.assertEqual(verification['frames'], 48)
+            self.assertEqual(verification['decode'], 'PASS')
+
+    def test_repair_keeps_donating_caption_visible(self):
+        cues = self._render_caption_repair(
+            ['A: Hello there', 'B: Yes'],
+            [(0, 1, 'Hello'), (1, 1, ' there'), (1, 1.04, ' Yes')], 24960)
+        self.assertEqual([(c['start'], c['end']) for c in cues], [(0, 1), (1, 1.04)])
+
+    def test_repair_can_span_anchor_when_a_one_sided_gap_misses_frame(self):
+        cues = self._render_caption_repair(
+            ['A: Hi', 'B: Yes', 'A: Bye'],
+            [(0, .96, 'Hi'), (1, 1, ' Yes'), (1.01, 2, ' Bye')], 48000)
+        self.assertEqual(cues[0]['end'], .96)
+        self.assertEqual(cues[2]['start'], 1.01)
+        self.assertLessEqual(cues[1]['start'], 1)
+        self.assertGreater(cues[1]['end'], 1)
+
+    def test_repair_checks_interior_trim_splits(self):
+        cues = self._render_caption_repair(
+            ['A: One', 'B: Two', 'A: Three Four'],
+            [(.02, .10, 'One'), (.10, .10, ' Two'), (.10, .10, ' Three'), (.10, .16, ' Four')],
+            3840)
+        self.assertLessEqual(cues[1]['start'], 2 / 24)
+        self.assertGreater(cues[1]['end'], 2 / 24)
+
+    def test_repair_followup_can_change_an_earlier_loan_from_same_donor(self):
+        cues = self._render_caption_repair(
+            ['A: One Two Three', 'B: Four', 'A: Five'],
+            [(.04, .08, 'One'), (.08, .08, ' Two'), (.08, .14, ' Three'),
+             (.14, .14, ' Four'), (.14, .18, ' Five')], 4320)
+        self.assertLessEqual(cues[1]['start'], 3 / 24)
+        self.assertGreater(cues[1]['end'], 3 / 24)
+
+    def _render_caption_repair(self, script_lines, entries, samples):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            args = cli_fixture(root, ['Script', *script_lines])
+            with wave.open(str(root/'narration.wav'), 'wb') as wav:
+                wav.setparams((1, 2, 24_000, 0, 'NONE', 'not compressed'))
+                wav.writeframes(b'\x01\x00' * samples)
+            for name in ('a', 'b'):
+                Image.new('RGB', (64, 80), 'green').save(root/f'{name}.png')
+            cache = root/'input.json'
+            raw = json.dumps({'segments': [dict(words=[dict(start=a, end=b, word=text)
+                                                       for a, b, text in entries])]})
+            cache.write_text(raw)
+            out = root/'full'
+            self.assertEqual(main(args + ['--words-json', str(cache), '--repair-zero-duration',
+                                          '--font', FONT, '--output', str(out)]), 0)
+            self.assertEqual(cache.read_text(), raw)
+            self.assertEqual((out/'words.json').read_text(), raw)
+            verification = json.loads((out/'verification.json').read_text())
+            self.assertEqual(verification['frames'], (samples + 999) // 1000)
+            self.assertEqual(verification['decode'], 'PASS')
+            return json.loads((out/'plan.json').read_text())['captions']
+
     def test_preview_with_optional_mouth_motion_encodes_without_changing_inputs(self):
         from PIL import Image, ImageChops, ImageDraw
         with tempfile.TemporaryDirectory() as temp:
