@@ -145,6 +145,7 @@ def make_video(args, directory, config, turns, cues, scenes, duration, font, unm
     renderer = Renderer(args.portrait_a, args.portrait_b, font,
                         config.get('title', 'Podcast'), turns, cues, scenes, fps=FPS,
                         unmatched_words=unmatched_words,
+                        mouth_motion=config.get('mouth_motion'),
                         frame_window=range(first, last) if args.preview else None)
     audio = directory / 'audio.m4a'
     pcm = directory / 'analysis.wav'
@@ -196,13 +197,17 @@ def build(args):
     cfg = json.loads(args.config.read_text(encoding='utf-8')) if args.config else {}
     if not isinstance(cfg, dict) or not isinstance(cfg.get('title', 'Podcast'), str):
         raise ValueError('Config must be a JSON object with an optional text title')
+    points = {}
+    if 'mouth_motion' in cfg:
+        from .mouth import parse_mouth_motion
+        points = parse_mouth_motion(cfg['mouth_motion'])
     if not args.plan_only:
-        from .render import _load_portrait, load_font
+        from .render import _read_portrait, load_font
 
         font = args.font or Path(os.environ.get('PVK_FONT', str(MAC_FONT)))
         load_font(font)
-        for portrait in (args.portrait_a, args.portrait_b):
-            _load_portrait(portrait)
+        for speaker, portrait in (('A', args.portrait_a), ('B', args.portrait_b)):
+            _read_portrait(portrait, points.get(speaker), speaker)
     out = args.output.resolve()
     out.mkdir(mode=0o700, parents=True, exist_ok=False)
     raw = transcribe(args)

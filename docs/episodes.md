@@ -12,6 +12,23 @@ During the exact time span of a spoken word with no matched characters, the stud
 
 Each caption cue that overlaps the selected render window must be visible on at least one frame at 24 fps. If a cue falls between frames, the render error gives the cue number and time range. Adjust the word timing or preview bounds and retry. Preview text fitting covers the captions and cards visible in that preview. Review warnings and play back the preview before rendering the full recording.
 
+## Optional mouth motion
+
+Add `mouth_motion` to your `--config private/episode.json` to animate one or both of your existing portraits. For example:
+
+```json
+{
+  "mouth_motion": {
+    "A": [0.49, 0.64, 0.13],
+    "B": [0.52, 0.62, 0.12]
+  }
+}
+```
+
+Replace the sample values with measurements from each portrait. Open the original image as displayed after EXIF rotation or mirroring, including any transparent margins. Divide the mouth center's horizontal pixel position by the image width, its vertical position by the image height, and the distance between the lip corners by the image width. Values must be between 0 and 1, and the lip area must fit inside the portrait. Omit a speaker to leave that portrait still, or omit the entire field to keep the default behavior. This field can coexist with `title` and `scenes` in the same file.
+
+The renderer stretches a small region of the original portrait and adds a shaded inner-mouth opening. The current speaker's audio level selects a cached pose; during silence, unmatched speech, and the other speaker's turn, the portrait returns to the original image. This is not phoneme lip sync. Use a short `--preview` with both speakers and a pause to check the landmarks before rendering the whole episode. Keep episode-specific calibration private.
+
 ## Optional concept cards
 
 Supply `--config private/episode.json` using this structure:
