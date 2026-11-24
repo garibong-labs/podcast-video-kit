@@ -10,7 +10,9 @@ A local command-line tool that turns a Word script, a WAV recording, and two por
 
 ## Install and run
 
-Install FFmpeg and a font that covers your script language. On macOS, `brew install ffmpeg` provides `ffmpeg` and `ffprobe`. From the checkout:
+Install FFmpeg and a font that covers your script language. On macOS, `brew install ffmpeg` provides `ffmpeg` and `ffprobe`. On Linux, set `font` in `episode.json` to the installed font file’s path or export `PVK_FONT` with that path; the default font path is macOS-only.
+
+From the checkout:
 
 ```bash
 python3 -m venv .venv
