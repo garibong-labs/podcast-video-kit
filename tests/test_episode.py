@@ -565,10 +565,10 @@ class PlanningTests(unittest.TestCase):
             return dict(segments=[seg])
 
         for times in (((.1, .4), (.3, .3), (.5, .7)),
-                      ((.1, .4), (.4, .4), (.4, .7)),
+                      ((.39, .4), (.4, .4), (.4, .41)),
                       ((.1, .4), (.5, .5), (.45, .7)),
                       ((.1, .4), (1.01, 1.01)),
-                      ((.1, .4), (.4001, .4001), (.401, .7))):
+                      ((.39, .4), (.4001, .4001), (.401, .411))):
             with self.subTest(times=times), self.assertRaisesRegex(ValueError, 'Cannot estimate.*words\\[1\\]'):
                 repair_zero_duration(src(*times), 1)
         clipped, estimates = repair_zero_duration(src((.1, .4), (.38, .5)), 1)
@@ -581,6 +581,35 @@ class PlanningTests(unittest.TestCase):
         mismatch, _ = repair_zero_duration(src((.3, .3), (.3, .5), text='Other text'), 1)
         with self.assertRaisesRegex(ValueError, 'does not match'):
             read_words(mismatch, 1)
+
+    def test_repair_can_trim_touching_neighbors_without_rewriting_original(self):
+        def word(start, end, text):
+            return dict(start=start, end=end, word=text)
+
+        src = {'segments': [dict(words=[word(0, .1, 'Hi'), word(.1, .1, ' there')]),
+                            dict(words=[word(.1, .25, ' friend'), word(.25, .25, ' and'),
+                                        word(.25, .25, ' then'), word(.25, .29, ' goodbye')])]}
+        original = json.dumps(src)
+        repaired, records = repair_zero_duration(src, 1)
+        self.assertEqual(json.dumps(src), original)
+        words = read_words(repaired, 1)
+        self.assertEqual([text for _, _, text in words], ['Hi', ' there', ' friend', ' and', ' then', ' goodbye'])
+        self.assertTrue(all(a < b for a, b, _ in words))
+        self.assertTrue(all(a[1] <= b[0] for a, b in zip(words, words[1:])))
+        self.assertAlmostEqual(words[0][1], .08)
+        self.assertAlmostEqual(words[2][1], .21)
+        self.assertEqual(words[-1][:2], (.25, .29))
+        neighbors = [item for item in records if item.get('kind') == 'neighbor_boundary']
+        self.assertEqual([(item['segment'], item['word']) for item in neighbors], [(0, 0), (1, 0)])
+
+    def test_repair_can_share_boundary_budget_between_both_neighbors(self):
+        words = [dict(start=a, end=b, word=' x') for a, b in ((.16, .2), (.2, .2), (.2, .2), (.2, .24))]
+        repaired, records = repair_zero_duration(dict(segments=[dict(words=words)]), 1)
+        times = [(a, b) for a, b, _ in read_words(repaired, 1)]
+        for actual, expected in zip(times, ((.16, .18), (.18, .2), (.2, .22), (.22, .24))):
+            for a, b in zip(actual, expected):
+                self.assertAlmostEqual(a, b)
+        self.assertEqual(sum(r.get('kind') == 'neighbor_boundary' for r in records), 2)
 
     def test_concepts_preserve_explicit_body_and_reject_overlap(self):
         turns = [dict(start=0, end=3), dict(start=3.5, end=5)]
@@ -618,8 +647,8 @@ class MediaSmokeTest(unittest.TestCase):
                 Image.new('RGB', (64, 80), 'green').save(root/f'{name}.png')
             cache = root/'input.json'
             cache.write_text(json.dumps({'segments': [dict(words=[
-                dict(start=0, end=.3, word='Hello'),
-                dict(start=.5, end=.5, word=' Good'), dict(start=.5, end=.8, word=' morning'),
+                dict(start=0, end=.5, word='Hello'),
+                dict(start=.5, end=.5, word=' Good'), dict(start=.5, end=1.1, word=' morning'),
                 dict(start=1.1, end=1.1, word=' Goodbye'), dict(start=1.1, end=1.5, word=' friend')])]}))
             out = root/'preview'
             self.assertEqual(main(args + ['--words-json', str(cache), '--repair-zero-duration',
@@ -627,6 +656,9 @@ class MediaSmokeTest(unittest.TestCase):
             verification = json.loads((out/'verification.json').read_text())
             self.assertEqual(verification['decode'], 'PASS')
             self.assertEqual(verification['frames'], 48)
+            plan = json.loads((out/'plan.json').read_text())
+            self.assertEqual(sum(r.get('kind') == 'neighbor_boundary'
+                                 for r in plan['estimated_word_timings']), 2)
             self.assertTrue((out/'preview.mp4').is_file())
 
     def test_preview_passes_with_an_oversized_card_outside_its_window(self):

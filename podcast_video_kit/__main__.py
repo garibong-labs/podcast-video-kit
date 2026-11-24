@@ -224,7 +224,9 @@ def build(args):
                 captions=cues, scenes=scenes)
     if estimates:
         plan['estimated_word_timings'] = estimates
-        print(f'Estimated timings for {len(estimates)} zero-duration ASR token(s); '
+        boundaries = sum(row.get('kind') == 'neighbor_boundary' for row in estimates)
+        print(f'Estimated timings for {len(estimates) - boundaries} zero-duration ASR token(s) '
+              f'with {boundaries} neighboring boundary adjustment(s); '
               'review estimated_word_timings in plan.json and check playback.', file=sys.stderr)
     json_write(out / 'plan.json', plan)
     (out / 'captions.srt').write_text(srt(cues), encoding='utf-8')
@@ -276,7 +278,7 @@ def main(argv=None):
     source.add_argument('--whisper-model', type=Path, help='Existing trusted local OpenAI Whisper checkpoint (.pt)')
     source.add_argument('--words-json', type=Path, help='Local Whisper JSON for the same WAV; reuse without inference')
     arg.add_argument('--repair-zero-duration', action='store_true',
-                     help='Estimate zero-duration word timings only where neighboring timestamps leave room')
+                     help='Estimate zero-duration word timings with bounded neighboring boundary adjustments')
     arg.add_argument('--language', help='Optional Whisper language code (otherwise autodetect)')
     arg.add_argument('--font', type=Path, help='Local font; defaults to PVK_FONT or macOS Apple SD Gothic Neo')
     arg.add_argument('--config', type=Path, help='Optional local title and concept scene JSON')

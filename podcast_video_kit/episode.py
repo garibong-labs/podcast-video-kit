@@ -290,8 +290,15 @@ def _word_fields(w, location, duration):
     return start, end, w['word']
 
 
+def _boundary_budget(token, effective_start, duration):
+    _, _, entry, start, end = token
+    remaining = min(duration, float(entry['end'])) - effective_start
+    used = (float(entry['start']) - start) + (end - float(entry['end']))
+    return max(0.0, min(.04 - used, remaining - max(.02, (end - start) / 2)))
+
+
 def repair_zero_duration(transcript, duration):
-    """Estimate only zero-width nonblank tokens that fit between their neighbors."""
+    """Estimate zero-width nonblank tokens with limited neighboring boundary edits."""
     repaired = deepcopy(transcript)
     tokens = []
     for i, _, entries, _ in _segments(repaired):
@@ -302,11 +309,12 @@ def repair_zero_duration(transcript, duration):
 
     estimates, blocked = [], []
     previous = 0.0
+    previous_start = 0.0
     k = 0
     while k < len(tokens):
-        i, j, _, start, end = tokens[k]
+        _, _, token, start, end = tokens[k]
         if start < end:
-            # Leave all original positive spans to the strict reader.
+            previous_start = max(previous, float(token['start']))
             previous = max(previous, min(duration, end))
             k += 1
             continue
@@ -318,6 +326,26 @@ def repair_zero_duration(transcript, duration):
         wanted = .10 * count
         minimum = .02 * count
         lo, hi = max(previous, start - wanted), min(following, start + wanted)
+        deficit = minimum - (hi - lo)
+        if previous <= start <= following and deficit > 1e-10:
+            # At a cramped boundary, borrow only the missing time from the
+            # adjacent positive words. Keep at least half and 20 ms of each.
+            left = tokens[k - 1] if k and tokens[k - 1][3] < tokens[k - 1][4] else None
+            right = tokens[stop] if stop < len(tokens) and tokens[stop][3] < tokens[stop][4] else None
+            left_take = min(deficit, _boundary_budget(left, previous_start, duration)) if left else 0.0
+            right_take = min(deficit - left_take, _boundary_budget(right, following, duration)) if right else 0.0
+            if left_take + right_take >= deficit - 1e-10:
+                for adjacent, edge, take in ((left, 'end', left_take), (right, 'start', right_take)):
+                    if not adjacent or take <= 1e-10:
+                        continue
+                    seg, idx, entry, _, _ = adjacent
+                    a, b = float(entry['start']), float(entry['end'])
+                    boundary = lo - take if edge == 'end' else hi + take
+                    entry[edge] = boundary
+                    estimates.append(dict(kind='neighbor_boundary', segment=seg, word=idx,
+                                          original_start=a, original_end=b,
+                                          start=float(entry['start']), end=float(entry['end'])))
+                lo, hi = lo - left_take, hi + right_take
         if previous <= start <= following and hi - lo >= minimum - 1e-10:
             # Take up to 100 ms per token. Prefer the gap to the left, then
             # the right; straddle the anchor only if neither side fits alone.
@@ -339,8 +367,8 @@ def repair_zero_duration(transcript, duration):
 
     if blocked:
         sample = ', '.join(blocked[:10])
-        raise ValueError(f'Cannot estimate {len(blocked)} zero-duration ASR token(s) without '
-                         f'overlap or moving neighboring words: {sample}; correct the original timing in a copy')
+        raise ValueError(f'Cannot estimate {len(blocked)} zero-duration ASR token(s) within '
+                         f'neighboring timing limits: {sample}; correct the original timing in a copy')
     return repaired, estimates
 
 
