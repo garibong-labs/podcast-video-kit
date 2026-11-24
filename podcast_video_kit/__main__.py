@@ -3,14 +3,12 @@ from __future__ import annotations
 
 import argparse
 from bisect import bisect_left
-from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
-import re
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -18,6 +16,7 @@ import wave
 from xml.etree.ElementTree import ParseError
 from zipfile import BadZipFile
 
+from .config import load_config
 from .episode import (check_script_length, concept_scenes, plan_word_alignment,
                       prepare_word_timings, script, srt)
 
@@ -60,13 +59,9 @@ def duration_wav(path):
 def transcribe(args):
     if args.words_json:
         return args.words_json.read_bytes()
-    if not args.whisper_model:
-        raise ValueError('Supply an existing local --whisper-model .pt file or --words-json')
     model = args.whisper_model.resolve(strict=True)
     if not model.is_file() or model.suffix.lower() != '.pt':
         raise ValueError('Use an existing trusted Whisper .pt model; no downloads are attempted')
-    if args.language is not None and re.fullmatch('[A-Za-z]{2,3}', args.language) is None:
-        raise ValueError('--language must be a language code, e.g. ko or en')
     # The subprocess emits a raw transcript named after the input WAV. Never
     # place it under the run directory, which may be inside a Git checkout.
     with TemporaryDirectory(prefix='podcast-video-kit-') as tmp:
@@ -183,9 +178,7 @@ def make_video(args, directory, config, turns, cues, scenes, duration, font, unm
     return dict(result, mode='preview' if args.preview else 'full', preview_offset=start)
 
 
-def build(args):
-    if args.preview_start < 0 or (args.preview_start and not args.preview):
-        raise ValueError('--preview-start requires --preview and a nonnegative time')
+def build(args, cfg):
     for file in (args.script, args.narration, args.portrait_a, args.portrait_b):
         if not file.is_file():
             raise ValueError(f'Input file not found: {file}')
@@ -194,9 +187,6 @@ def build(args):
     duration = duration_wav(args.narration)
     if args.preview:
         _render_window(args, duration)
-    cfg = json.loads(args.config.read_text(encoding='utf-8')) if args.config else {}
-    if not isinstance(cfg, dict) or not isinstance(cfg.get('title', 'Podcast'), str):
-        raise ValueError('Config must be a JSON object with an optional text title')
     points = {}
     if 'mouth_motion' in cfg:
         from .mouth import parse_mouth_motion
@@ -208,7 +198,7 @@ def build(args):
         load_font(font)
         for speaker, portrait in (('A', args.portrait_a), ('B', args.portrait_b)):
             _read_portrait(portrait, points.get(speaker), speaker)
-    out = args.output.resolve()
+    out = args.output
     out.mkdir(mode=0o700, parents=True, exist_ok=False)
     raw = transcribe(args)
     transcript = json.loads(raw.decode('utf-8'))
@@ -242,55 +232,17 @@ def build(args):
         print(f"Verified {result['mode']}: {result['frames']} frames; see verification.json", flush=True)
 
 
-def positive(value):
-    n = float(value)
-    if not math.isfinite(n) or n <= 0 or n > 120:
-        raise argparse.ArgumentTypeError('Use an excerpt length greater than 0 and up to 120 seconds')
-    return n
-
-
-def finite_seconds(value):
-    try:
-        seconds = Decimal(value)
-    except InvalidOperation as exc:
-        raise argparse.ArgumentTypeError('Use a finite preview offset') from exc
-    if not seconds.is_finite():
-        raise argparse.ArgumentTypeError('Use a finite preview offset')
-    if not seconds:
-        return Fraction(0)
-    if seconds.adjusted() < -12:
-        # Sub-picosecond offsets always map to frame zero on valid WAVs.
-        # Keep the sign without expanding arbitrary negative exponents.
-        return Fraction(-1 if seconds.is_signed() else 1, 10**12)
-    if seconds.adjusted() > 20:
-        # Far beyond any WAV duration; avoid expanding arbitrary exponents.
-        raise argparse.ArgumentTypeError('Preview offset is out of range')
-    return Fraction(seconds)
-
-
 def main(argv=None):
-    arg = argparse.ArgumentParser(prog='podcast-video-kit', description=__doc__)
-    arg.add_argument('--script', type=Path, required=True, help='DOCX with A:/B: turns')
-    arg.add_argument('--section', default='7. 팟캐스트 대본', help='Exact DOCX section heading')
-    arg.add_argument('--narration', type=Path, required=True, help='Complete supplied recording (WAV)')
-    arg.add_argument('--portrait-a', type=Path, required=True, help='Portrait driven by voice A')
-    arg.add_argument('--portrait-b', type=Path, required=True, help='Portrait driven by voice B')
-    arg.add_argument('--output', type=Path, required=True, help='A new private run folder (e.g. runs/preview)')
-    source = arg.add_mutually_exclusive_group(required=True)
-    source.add_argument('--whisper-model', type=Path, help='Existing trusted local OpenAI Whisper checkpoint (.pt)')
-    source.add_argument('--words-json', type=Path, help='Local Whisper JSON for the same WAV; reuse without inference')
-    arg.add_argument('--repair-zero-duration', action='store_true',
-                     help='Estimate zero-duration word timings with bounded neighboring boundary adjustments')
-    arg.add_argument('--language', help='Optional Whisper language code (otherwise autodetect)')
-    arg.add_argument('--font', type=Path, help='Local font; defaults to PVK_FONT or macOS Apple SD Gothic Neo')
-    arg.add_argument('--config', type=Path, help='Optional local title and concept scene JSON')
-    mode = arg.add_mutually_exclusive_group()
-    mode.add_argument('--preview', type=positive, metavar='SECONDS', help='Render only a sample; default is full')
-    mode.add_argument('--plan-only', action='store_true', help='Only generate alignment, scene plan and SRT')
-    arg.add_argument('--preview-start', type=finite_seconds, default=Fraction(0), metavar='SECONDS')
-    args = arg.parse_args(argv)
+    arg = argparse.ArgumentParser(prog='podcast-video-kit', description=__doc__, allow_abbrev=False)
+    arg.add_argument('--config', metavar='EPISODE.JSON', action='append', help='Local episode JSON (required)')
+    options, extra = arg.parse_known_args(argv)
+    if extra:
+        arg.error('Move episode flags into episode.json and run podcast-video-kit --config episode.json; see README.md')
+    if not options.config or len(options.config) != 1:
+        arg.error('Provide exactly one --config EPISODE.JSON')
     try:
-        build(args)
+        args, cfg = load_config(options.config[0])
+        build(args, cfg)
     except (OSError, ValueError, TypeError, KeyError, IndexError, StopIteration, BadZipFile,
             ParseError, wave.Error, subprocess.SubprocessError) as exc:
         print(f'Cannot build episode: {exc}', file=sys.stderr)

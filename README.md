@@ -20,7 +20,27 @@ source .venv/bin/activate
 python -m pip install -e .
 ```
 
-If you already have word-timestamp JSON for the same WAV, pass `--words-json path/to/words.json` in place of `--whisper-model … --language ko` and skip the Whisper setup. The commands below install Whisper on macOS and prepare `small.pt` once in `$HOME/.cache/whisper` using one second of generated silence. On Linux, install the Whisper CLI for your system and start at `sample_dir`. This setup runs separately from `podcast-video-kit`.
+Put your settings in a local `episode.json`, for example in a directory with your private inputs:
+
+```json
+{
+  "script": "script.docx",
+  "narration": "narration.wav",
+  "portrait_a": "A.png",
+  "portrait_b": "B.png",
+  "words_json": "words.json",
+  "preview": 30,
+  "output": "runs/episode-preview"
+}
+```
+
+```bash
+podcast-video-kit --config "private/episode.json"
+```
+
+All run settings come from that file. Relative paths (including `output`) are relative to the JSON file, not the terminal's working directory. Absolute paths and `~/` paths also work; shell variables inside JSON are not expanded. Old commands using individual flags must move those settings into JSON: for example, `--portrait-a` becomes `"portrait_a": "A.png"`, and `--preview 30` becomes `"preview": 30`.
+
+Use a word-timestamp cache from the same WAV to skip transcription. To transcribe instead, replace `words_json` with `"whisper_model": "~/.cache/whisper/small.pt"` and optionally add `"language": "ko"`. The commands below install Whisper on macOS and prepare `small.pt` once using one second of generated silence. On Linux, install the Whisper CLI for your system and start at `sample_dir`. This setup runs separately from `podcast-video-kit`.
 
 ```bash
 brew install openai-whisper
@@ -29,19 +49,12 @@ ffmpeg -v error -f lavfi -i anullsrc=r=16000:cl=mono -t 1 "$sample_dir/sample.wa
 whisper "$sample_dir/sample.wav" --model small --model_dir "$HOME/.cache/whisper" --device cpu --fp16 False --language ko --output_dir "$sample_dir" --output_format txt
 ```
 
-```bash
-podcast-video-kit --script "private/script.docx" --narration "private/narration.wav" \
-  --portrait-a "private/A.png" --portrait-b "private/B.png" \
-  --whisper-model "$HOME/.cache/whisper/small.pt" --language ko \
-  --output runs/episode-preview --preview 30
-```
+The model file must already exist. Use a trusted model: its loading is delegated to Whisper. No model is downloaded by the episode command. The default heading is `7. 팟캐스트 대본`; set `section` for a different heading. Dialogue starts with `A:` or `B:`. Matching keeps turn order, including repeat speakers; it does not identify speakers acoustically. Use portrait files in the same A/B order as the script and recording. Front-facing separate portraits work best. One image per person produces a wide two-portrait layout and 2D close-up, not six distinct camera angles. Add [optional mouth motion](docs/episodes.md#optional-mouth-motion) to animate the same images.
 
-The model file must already exist. Use a trusted model: its loading is delegated to Whisper. No model is downloaded by this command. The default heading is `7. 팟캐스트 대본`; specify a different one with `--section`. Dialogue starts with `A:` or `B:`. Matching keeps turn order, including repeat speakers; it does not identify speakers acoustically. Use portrait files in the same A/B order as the script and recording. Front-facing separate portraits work best. One image per person produces a wide two-portrait layout and 2D close-up, not six distinct camera angles. By default portraits stay still; enable [optional mouth motion](docs/episodes.md#optional-mouth-motion) with landmarks in `--config`. No additional images are required.
-
-- Start with `--preview 30` and optionally `--preview-start 60` to inspect another part of the episode. Preview offsets must be inside the WAV; they are then snapped to the nearest available video frame. With `--whisper-model`, even a preview transcribes the full WAV. Full and preview runs load the chosen font and check both portraits before transcription. `--plan-only` inspects alignment without loading the font or decoding the portraits. Use a fresh `--output` directory on every retry.
+- Start with `"preview": 30` and optionally `"preview_start": 60` to inspect another part of the episode. Preview offsets must be inside the WAV; they are then snapped to the nearest available video frame. With `whisper_model`, even a preview transcribes the full WAV. Full and preview runs load the chosen font and check both portraits before transcription. `"plan_only": true` inspects alignment without loading the font or decoding the portraits; omit `preview` and `preview_start` in that mode. Use a fresh `output` directory on every retry.
 - Review `plan.json`, especially low-coverage turns and unlabeled paragraphs (not silently read as dialogue). Subtitles come from the recording's ASR, not a verbatim copy of the script. Words that cross a speaker boundary are shown without a speaker label. If segment text and timed words disagree, or word timings are missing or invalid, the CLI identifies the offending entry. Correct the generated `words.json` or your original imported cache, then retry with a new output folder.
-- If Whisper reports a nonblank word with identical start and end times, retry with `--words-json` for the same WAV, `--repair-zero-duration`, and a fresh `--output`. The default remains strict. The option reserves time for later zero-duration words, including when they share a gap or borrow from opposite ends of one neighbor. A neighbor can lend up to 40 ms total, keeping at least half and at least 20 ms of its original duration. When a repair leaves a caption between video frames, the planner tries alternate bounded placements and checks the resulting captions, including those lending time. Planning uses the full-video frame grid, not the preview window. This does not remove words or change the source WAV or `words.json`. Check `estimated_word_timings` in `plan.json` and preview the affected times. When a `neighbor_boundary` record has `source_end`, it preserves the raw end; its `original_end` is after ordinary WAV-end clipping and before the repair trim. If the limits do not allow a repair or another timing error remains, correct the cache separately. Keep the option on subsequent runs reusing the same uncorrected cache.
-- To render the full recording, repeat the command with a **new** `--output runs/episode-full`, change `--whisper-model … --language ko` to `--words-json runs/episode-preview/words.json`, and omit both preview flags. Reuse word JSON only with the WAV it came from. `captions.srt` and plan timestamps always refer to the full recording, even in a preview run.
+- By default, nonblank words with identical start and end times get a bounded estimate and a warning. Set `"timing_mode": "strict"` to reject them without estimating. Repair reserves time for later zero-duration words, including when they share a gap or borrow from opposite ends of one neighbor. A neighbor can lend up to 40 ms total, keeping at least half and at least 20 ms of its original duration. If a repair leaves a caption between frames, the planner tries alternate bounded placements using the full-video frame grid. It does not remove words or change the WAV or raw `words.json`. Check `estimated_word_timings` in `plan.json` and play back the affected times. In a `neighbor_boundary` record, `source_end` (when present) is the raw end and `original_end` is the WAV-clipped end before the extra trim. If the limits do not allow a repair or another timing error remains, correct the cache separately.
+- To render the full recording, set a **new** `output` such as `runs/episode-full`, omit both preview keys, and use `words_json` for the same WAV. If you started with `whisper_model`, replace it with the new preview cache, e.g. `"words_json": "runs/episode-preview/words.json"`. `captions.srt` and plan timestamps always refer to the full recording, even in a preview run.
 - The full render keeps the supplied recording intact in time (no cuts, added gaps, or speed changes). It encodes the WAV to AAC once, copies that AAC track into the MP4, and verifies the copy and full decode. A preview encodes only the selected excerpt. Use `verification.json` and check the playback yourself.
 - [Optional concept cards](docs/episodes.md) use explicitly supplied text and ranges in the script. No guesses are made about which words or numbers to teach. Keep inputs and generated runs private. `words.json` and `plan.json` contain episode text and are ignored under custom run folders too. The command does not publish or overwrite inputs or runs.
 
