@@ -3,6 +3,8 @@ from fractions import Fraction
 import io
 import json
 from pathlib import Path
+import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -25,6 +27,25 @@ class ConfigTests(unittest.TestCase):
     def load(self, **changes):
         self.config.write_text(json.dumps(self.settings | changes), encoding='utf-8')
         return load_config(self.config)
+
+    def test_missing_heading_points_to_the_json_section_key(self):
+        self.load(section='Missing heading', plan_only=True)
+        with contextlib.redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(main(['--config', str(self.config)]), 1)
+        self.assertIn('set "section" in episode.json', error.getvalue())
+        self.assertNotIn('--section', error.getvalue())
+        self.assertFalse((self.root / 'runs').exists())
+
+    @unittest.skipUnless(shutil.which('git'), 'Needs git to verify ignore rules')
+    def test_private_manifests_are_ignored_but_templates_are_not(self):
+        rules = Path(__file__).resolve().parents[1] / '.gitignore'
+        shutil.copyfile(rules, self.root / '.gitignore')
+        subprocess.run(['git', 'init', '-q'], cwd=self.root, check=True)
+        for path in ('episode.json', 'subdir/episode.json', 'private/alternate.json', 'episode.example.json'):
+            with self.subTest(path=path):
+                result = subprocess.run(['git', '-c', 'core.excludesFile=/dev/null', 'check-ignore', '-q', '--', path],
+                                        cwd=self.root, check=False)
+                self.assertEqual(result.returncode, 1 if path == 'episode.example.json' else 0)
 
     def test_paths_use_the_manifest_directory_and_keep_the_font_default(self):
         absolute = self.root.parent / 'asset-test.png'
