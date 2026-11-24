@@ -222,7 +222,7 @@ def script(path, heading):
                 if text and num_id is not None and label is None and not SPEAKER.match(text):
                     if key.endswith(' ' + _heading_key(text)):
                         raise _unsupported_numbering(i)
-        raise ValueError('Expected one script heading; supply the exact heading with --section')
+        raise ValueError('Expected one script heading; set "section" in episode.json to the exact heading (it must be unique)')
     first = matching[0]
     heading_text, heading_level, heading_list, _, heading_label = rows[first]
     if heading_list is not None and heading_label is None and heading_level is None:

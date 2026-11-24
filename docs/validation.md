@@ -1,4 +1,18 @@
-# Initial-import validation
+# Validation
+
+## Current episode CLI
+
+From the installed development environment, run:
+
+```bash
+podcast-video-kit --help
+python -m unittest discover -s tests -v
+python -m compileall -q podcast_video_kit tools reference tests
+```
+
+CI runs on Python 3.11 and 3.14. Synthetic tests cover manifest validation, script and timing handling, caption visibility, and preview/full encodes with decode and AAC verification. Media smoke tests require FFmpeg, ffprobe, and a suitable local font. CI does not use private media or download Whisper models. For a real run, inspect `plan.json` and `verification.json`, then play the preview to check captions, audio, and mouth alignment.
+
+## Historical initial-import validation
 
 Validated locally on macOS arm64 with Python 3.14, Pillow 12.1.1, NumPy 2.4.3 and installed FFmpeg/ffprobe.
 
@@ -13,4 +27,4 @@ Validated locally on macOS arm64 with Python 3.14, Pillow 12.1.1, NumPy 2.4.3 an
 - No subjective audio listening performed during this import.
 - Public index: explicit source/docs/test allowlist; supplementary pattern scan found no personal home paths, personal identifiers, email addresses, common credential patterns, chat URLs or card-like numeric strings in the changed files at review time. This scan is not a guarantee; manual review and external-asset separation remain required.
 
-CI checks synthetic tests and source compilation without private media. Actual media rendering and screenshot comparisons require the private asset bundle and a compatible font.
+Recreating or comparing the original edit requires the private reference asset bundle and a compatible font; the current CLI's synthetic tests do not.

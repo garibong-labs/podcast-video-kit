@@ -116,12 +116,12 @@ class _Timeline:
 
 def load_font(path: Path, size: int = _TITLE_FONT_SIZE) -> ImageFont.FreeTypeFont:
     if not Path(path).is_file():
-        raise ValueError(f"Font file not found: {path}; use --font or PVK_FONT")
+        raise ValueError(f"Font file not found: {path}; set font in episode.json or PVK_FONT")
     try:
         # Use truetype's underlying loader without its system-font search.
         return ImageFont.FreeTypeFont(str(path), size)
     except OSError as exc:
-        raise ValueError(f"Cannot load font {path}: {exc}; use --font or PVK_FONT") from exc
+        raise ValueError(f"Cannot load font {path}: {exc}; set font in episode.json or PVK_FONT") from exc
 
 
 def _gradient(size: tuple[int, int], top: tuple, bottom: tuple) -> Image.Image:

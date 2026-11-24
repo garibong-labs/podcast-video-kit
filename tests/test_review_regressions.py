@@ -3,7 +3,6 @@ import contextlib
 from fractions import Fraction
 import io
 import json
-import os
 from pathlib import Path
 import shutil
 import tempfile
@@ -15,9 +14,9 @@ from zipfile import ZipFile
 
 from PIL import Image, ImageFont
 
-from podcast_video_kit.__main__ import _render_window, finite_seconds, main
+from podcast_video_kit.__main__ import _render_window
 from podcast_video_kit.episode import align, captions, normalized, read_words, script, srt
-from test_episode import FONT, NS, cli_fixture, docx, number_props
+from test_episode import FONT, NS, cli_fixture, docx, number_props, run_episode
 
 
 def write_wave(path, samples):
@@ -129,7 +128,7 @@ class ReviewRegressions(unittest.TestCase):
             font.write_bytes(ImageFont.load_default(size=36).font_bytes)
             model = root/'model.pt'
             model.touch()
-            args += ['--font', str(font), '--whisper-model', str(model)]
+            args.update(font=font.name, whisper_model=model.name)
             for bad, transparent in [('a.png', False), ('b.png', True)]:
                 for portrait in ('a.png', 'b.png'):
                     Image.new('RGBA', (12, 16), 'red').save(root/portrait)
@@ -137,7 +136,7 @@ class ReviewRegressions(unittest.TestCase):
                     Image.new('RGBA', (12, 16)).save(root/bad)
                 else:
                     (root/bad).write_bytes(b'not an image')
-                for mode in ([], ['--preview', '1']):
+                for mode in ({}, dict(preview=1)):
                     with self.subTest(bad=bad, mode=mode), \
                             patch('podcast_video_kit.__main__.duration_wav', return_value=2), \
                             patch('podcast_video_kit.__main__.transcribe', return_value=(
@@ -145,11 +144,11 @@ class ReviewRegressions(unittest.TestCase):
                             contextlib.redirect_stderr(io.StringIO()) as error:
                         with tempfile.TemporaryDirectory(dir=root) as temp_out:
                             out = Path(temp_out)/'render'
-                            self.assertEqual(main(args + mode + ['--output', str(out)]), 1)
+                            self.assertEqual(run_episode(root, args, output=str(out), **mode), 1)
                             whisper.assert_not_called()
                             self.assertIn(bad, error.getvalue())
                             self.assertFalse(out.exists())
-                            self.assertEqual(main(args + ['--plan-only','--output',str(out)]), 0)
+                            self.assertEqual(run_episode(root, args, plan_only=True, output=str(out)), 0)
                             whisper.assert_called_once()
                             self.assertTrue((out/'plan.json').is_file())
 
@@ -159,7 +158,7 @@ class ReviewRegressions(unittest.TestCase):
                 _render_window(SimpleNamespace(preview=1, preview_start=start), Fraction('1.001'))
         self.assertEqual(_render_window(SimpleNamespace(preview=1, preview_start='1.035'), Fraction('1.04')),
                          (24, 25, Fraction(1), Fraction('1.04')))
-        just_inside = finite_seconds('1.039999999999999999')
+        just_inside = Fraction('1.039999999999999999')
         self.assertEqual(_render_window(SimpleNamespace(preview=1, preview_start=just_inside), Fraction('1.04')),
                          (24, 25, Fraction(1), Fraction('1.04')))
         self.assertEqual(_render_window(SimpleNamespace(preview=.04, preview_start='.06'), Fraction(2)),
@@ -176,14 +175,9 @@ class ProbeRegressions(unittest.TestCase):
             write_wave(wav, 24_000)
             words = root / 'input.json'
             words.write_text(json.dumps({'segments': [{'words': [dict(start=0, end=1, word='Hello')]}]}))
-            cwd = Path.cwd()
-            try:
-                os.chdir(root)
-                args[5] = './-take.wav'
-                self.assertEqual(main(args + ['--words-json', str(words), '--plan-only', '--output', 'result']), 0)
-                self.assertTrue(Path('result/plan.json').is_file())
-            finally:
-                os.chdir(cwd)
+            self.assertEqual(run_episode(root, args, narration=wav.name, words_json=words.name,
+                                         plan_only=True, output='result'), 0)
+            self.assertTrue((root/'result/plan.json').is_file())
 
 
 @unittest.skipUnless(FONT and shutil.which('ffmpeg') and shutil.which('ffprobe'), 'Needs ffmpeg and a local font')
@@ -197,10 +191,10 @@ class TailMediaRegressions(unittest.TestCase):
         words.write_text(json.dumps({'segments': [{'words': [dict(start=0, end=.95, word='Hello'),
                                                              dict(start=1, end=1.01, word=' Bye')]}]}))
         out = root / 'result'
-        args += ['--words-json', str(words), '--font', FONT, '--output', str(out)]
+        args.update(words_json=words.name, font=FONT, output=out.name)
         if preview:
-            args += ['--preview-start', '1', '--preview', '1']
-        self.assertEqual(main(args), 0)
+            args.update(preview_start=1, preview=1)
+        self.assertEqual(run_episode(root, args), 0)
         verify = json.loads((out / 'verification.json').read_text())
         self.assertEqual(verify['decode'], 'PASS')
         self.assertEqual(verify['frames'], 1 if preview else 25)

@@ -1,6 +1,6 @@
 # Public repository safety
 
-This repository contains source, numeric mouth calibration, documentation, and synthetic tests only. Private episode assets are supplied separately and staged under ignored runs/ directories.
+This repository contains source, legacy numeric mouth calibration, documentation, and synthetic tests only. Keep private episode assets and manifests outside the checkout or under ignored `private/` or `runs/` directories. `episode.json` is ignored by basename; keep custom-named manifests under `private/` or outside the checkout because they can contain local paths, episode text, and calibration values.
 
 Before publishing any change:
 1. Stage an explicit allowlist, inspect git diff --cached and git diff --cached --stat.

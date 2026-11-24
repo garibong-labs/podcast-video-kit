@@ -44,9 +44,14 @@ def cli_fixture(root, rows):
     docx(root/'script.docx', rows)
     for name in ('a.png', 'b.png', 'narration.wav'):
         (root/name).touch()
-    return ['--script', str(root/'script.docx'), '--section', 'Script',
-            '--narration', str(root/'narration.wav'), '--portrait-a', str(root/'a.png'),
-            '--portrait-b', str(root/'b.png')]
+    return dict(script='script.docx', section='Script', narration='narration.wav',
+                portrait_a='a.png', portrait_b='b.png')
+
+
+def run_episode(root, settings, **overrides):
+    config = root / 'episode.json'
+    config.write_text(json.dumps(settings | overrides), encoding='utf-8')
+    return main(['--config', str(config)])
 
 
 class PlanningTests(unittest.TestCase):
@@ -311,11 +316,11 @@ class PlanningTests(unittest.TestCase):
             with patch('podcast_video_kit.__main__.duration_wav', return_value=1):
                 cache.write_bytes(raw)
                 with patch('podcast_video_kit.__main__.command', side_effect=fake_whisper) as command:
-                    for flag, source, directory in (('--words-json', cache, 'imported'),
-                                                    ('--whisper-model', model, 'generated')):
+                    for flag, source, directory in (('words_json', cache, 'imported'),
+                                                    ('whisper_model', model, 'generated')):
                         with contextlib.redirect_stderr(io.StringIO()) as error:
-                            self.assertEqual(main(args + [flag, str(source), '--plan-only',
-                                                          '--output', str(root/directory)]), 1)
+                            self.assertEqual(run_episode(root, args, plan_only=True, output=directory,
+                                                         **{flag: source.name}), 1)
                         self.assertRegex(error.getvalue(), r'segments\[0\]\.text does not match its timed words')
                     command.assert_called_once()
                 self.assertEqual(cache.read_bytes(), raw)
@@ -325,8 +330,7 @@ class PlanningTests(unittest.TestCase):
                 words += [{'start': .4, 'end': .7, 'word': ' why'}, {'start': .7, 'end': 1, 'word': ' blue'}]
                 docx(root/'script.docx', ['Script', 'A: Red blue'])
                 cache.write_text(json.dumps({'segments': [{'text': '  ＲＥＤ, WHY! Blue.', 'words': words}]}))
-                self.assertEqual(main(args + ['--words-json', str(cache), '--plan-only',
-                                              '--output', str(root/'valid')]), 0)
+                self.assertEqual(run_episode(root, args, words_json=cache.name, plan_only=True, output='valid'), 0)
             plan = json.loads((root/'valid'/'plan.json').read_text())
             self.assertEqual(plan['turns'], [dict(speaker='A', text='Red blue', paragraph=2,
                                                  coverage=1, start=.1, end=1)])
@@ -340,7 +344,7 @@ class PlanningTests(unittest.TestCase):
             model, missing, corrupt = (root/name for name in ('model.pt', 'missing.ttf', 'corrupt.ttf'))
             model.touch()
             corrupt.write_bytes(b'not a font')
-            args += ['--whisper-model', str(model)]
+            args['whisper_model'] = model.name
 
             def fake_whisper(command):
                 raw_dir = Path(command[command.index('--output_dir') + 1])
@@ -350,25 +354,25 @@ class PlanningTests(unittest.TestCase):
             with patch('podcast_video_kit.__main__.duration_wav', return_value=1), \
                     patch('podcast_video_kit.__main__.command') as command, \
                     patch.dict(os.environ, PVK_FONT=str(corrupt)):
-                for font_args, mode, message, path in (
-                    (['--font', str(missing)], [], 'Font file not found', missing),
-                    ([], ['--preview', '1'], 'Cannot load font', corrupt),
+                for options, message, path in (
+                    (dict(font=missing.name), 'Font file not found', missing),
+                    (dict(preview=1), 'Cannot load font', corrupt),
                 ):
                     with contextlib.redirect_stderr(io.StringIO()) as error:
-                        self.assertEqual(main(args + font_args + mode + ['--output', str(root/'render')]), 1)
+                        self.assertEqual(run_episode(root, args, output='render', **options), 1)
                     self.assertIn(message, error.getvalue())
                     self.assertIn(str(path), error.getvalue())
                 self.assertFalse((root/'render').exists())
                 del os.environ['PVK_FONT']
                 with patch('podcast_video_kit.__main__.MAC_FONT', corrupt), \
                         contextlib.redirect_stderr(io.StringIO()) as error:
-                    self.assertEqual(main(args + ['--output', str(root/'default')]), 1)
+                    self.assertEqual(run_episode(root, args, output='default'), 1)
                     self.assertIn(f'Cannot load font {corrupt}', error.getvalue())
                 command.assert_not_called()
                 command.side_effect = fake_whisper
                 for path in (missing, corrupt):
                     out = root/path.stem
-                    self.assertEqual(main(args + ['--font', str(path), '--plan-only', '--output', str(out)]), 0)
+                    self.assertEqual(run_episode(root, args, font=path.name, plan_only=True, output=out.name), 0)
                     self.assertTrue((out/'plan.json').is_file())
 
     def test_long_script_is_rejected_before_whisper_in_plan_and_preview(self):
@@ -378,10 +382,9 @@ class PlanningTests(unittest.TestCase):
             model = root/'model.pt'
             model.touch()
             with patch('podcast_video_kit.__main__.command') as command:
-                for mode in (['--plan-only'], ['--preview', '1']):
+                for mode in (dict(plan_only=True), dict(preview=1)):
                     with self.subTest(mode=mode), contextlib.redirect_stderr(io.StringIO()) as error:
-                        self.assertEqual(main(args + ['--whisper-model', str(model),
-                                                      '--output', str(root/'run')] + mode), 1)
+                        self.assertEqual(run_episode(root, args, whisper_model=model.name, output='run', **mode), 1)
                         self.assertIn('30,000 normalized characters', error.getvalue())
                 command.assert_not_called()
             self.assertFalse((root/'run').exists())
@@ -436,8 +439,7 @@ class PlanningTests(unittest.TestCase):
             out = root/'render'
             with patch('podcast_video_kit.__main__.duration_wav', return_value=2), \
                     patch('podcast_video_kit.__main__.make_video', side_effect=check_frames):
-                self.assertEqual(main(args + ['--words-json', str(cache), '--font', str(font_path),
-                                              '--output', str(out)]), 0)
+                self.assertEqual(run_episode(root, args, words_json=cache.name, font=font_path.name, output=out.name), 0)
             plan = json.loads((out/'plan.json').read_text())
             self.assertEqual(plan['turns'], [dict(speaker='A', text='Red blue', paragraph=2,
                                                  start=0, end=2, coverage=1)])
@@ -463,13 +465,11 @@ class PlanningTests(unittest.TestCase):
                 locations.append(raw_dir)
                 (raw_dir/'take.json').write_text(json.dumps(expected))
 
-            args = ['--script', str(checkout/'script.docx'), '--section', 'Script',
-                    '--narration', str(checkout/'take.wav'), '--portrait-a', str(checkout/'a.png'),
-                    '--portrait-b', str(checkout/'b.png'), '--whisper-model', str(checkout/'model.pt'),
-                    '--plan-only', '--output', str(run)]
+            args = dict(script='script.docx', section='Script', narration='take.wav', portrait_a='a.png',
+                        portrait_b='b.png', whisper_model='model.pt', plan_only=True, output=run.name)
             with patch('podcast_video_kit.__main__.command', side_effect=fake_whisper), \
                     patch('podcast_video_kit.__main__.duration_wav', return_value=1):
-                self.assertEqual(main(args), 0)
+                self.assertEqual(run_episode(checkout, args), 0)
             self.assertFalse(locations[0].exists())
             self.assertEqual(json.loads((run/'words.json').read_text()), expected)
             self.assertEqual({p.name for p in run.iterdir()}, {'words.json', 'plan.json', 'captions.srt'})
@@ -483,18 +483,17 @@ class PlanningTests(unittest.TestCase):
             for name in ('a.png', 'b.png', 'narration.wav'):
                 (p/name).touch()
             (p/'input.json').write_text(json.dumps(src))
-            args = ['--script', str(p/'script.docx'), '--section', 'Script',
-                    '--narration', str(p/'narration.wav'), '--portrait-a', str(p/'a.png'),
-                    '--portrait-b', str(p/'b.png'), '--words-json', str(p/'input.json'),
-                    '--plan-only', '--output', str(p/'run')]
+            args = dict(script='script.docx', section='Script', narration='narration.wav', portrait_a='a.png',
+                        portrait_b='b.png', words_json='input.json', plan_only=True, output='run',
+                        timing_mode='strict')
             with patch('podcast_video_kit.__main__.duration_wav', return_value=1), \
                     contextlib.redirect_stderr(io.StringIO()) as error:
-                self.assertEqual(main(args), 1)
+                self.assertEqual(run_episode(p, args), 1)
             self.assertRegex(error.getvalue(), r'segments\[0\]\.words\[0\] has no positive duration')
             self.assertEqual(json.loads((p/'input.json').read_text()), src)
             self.assertFalse(list((p/'run').iterdir()))
 
-    def test_cli_opt_in_repairs_multiple_zero_spans_without_rewriting_raw_cache(self):
+    def test_cli_repairs_multiple_zero_spans_without_rewriting_raw_cache(self):
         def word(start, end, text):
             return dict(start=start, end=end, word=text)
 
@@ -519,11 +518,9 @@ class PlanningTests(unittest.TestCase):
             with patch('podcast_video_kit.__main__.duration_wav', return_value=2), \
                     patch('podcast_video_kit.__main__.command', side_effect=fake_whisper) as command, \
                     contextlib.redirect_stderr(io.StringIO()) as warning:
-                options = ['--repair-zero-duration', '--plan-only']
-                self.assertEqual(main(args + options + ['--words-json', str(cache), '--output', str(out)]), 0)
+                self.assertEqual(run_episode(root, args, plan_only=True, words_json=cache.name, output=out.name), 0)
                 command.assert_not_called()
-                self.assertEqual(main(args + options + ['--whisper-model', str(model),
-                                                       '--output', str(root/'generated')]), 0)
+                self.assertEqual(run_episode(root, args, plan_only=True, whisper_model=model.name, output='generated'), 0)
                 command.assert_called_once()
             self.assertIn('Estimated timings for 3', warning.getvalue())
             self.assertEqual(cache.read_bytes(), original)
@@ -719,8 +716,7 @@ class MediaSmokeTest(unittest.TestCase):
                 dict(start=.5, end=.5, word=' Good'), dict(start=.5, end=1.1, word=' morning'),
                 dict(start=1.1, end=1.1, word=' Goodbye'), dict(start=1.1, end=1.5, word=' friend')])]}))
             out = root/'preview'
-            self.assertEqual(main(args + ['--words-json', str(cache), '--repair-zero-duration',
-                                          '--font', FONT, '--preview', '2', '--output', str(out)]), 0)
+            self.assertEqual(run_episode(root, args, words_json=cache.name, font=FONT, preview=2, output=out.name), 0)
             verification = json.loads((out/'verification.json').read_text())
             self.assertEqual(verification['decode'], 'PASS')
             self.assertEqual(verification['frames'], 48)
@@ -744,8 +740,7 @@ class MediaSmokeTest(unittest.TestCase):
                 dict(start=0, end=1, word='Hi'), dict(start=1, end=1, word=' Yes'),
                 dict(start=1, end=2, word=' Bye')])]}))
             out = root/'preview'
-            self.assertEqual(main(args + ['--words-json', str(cache), '--repair-zero-duration',
-                                          '--font', FONT, '--preview', '2', '--output', str(out)]), 0)
+            self.assertEqual(run_episode(root, args, words_json=cache.name, font=FONT, preview=2, output=out.name), 0)
             plan = json.loads((out/'plan.json').read_text())
             self.assertEqual(plan['captions'][1], dict(start=1, end=1.02, speaker='B', text='Yes'))
             verification = json.loads((out/'verification.json').read_text())
@@ -798,8 +793,7 @@ class MediaSmokeTest(unittest.TestCase):
                                                        for a, b, text in entries])]})
             cache.write_text(raw)
             out = root/'full'
-            self.assertEqual(main(args + ['--words-json', str(cache), '--repair-zero-duration',
-                                          '--font', FONT, '--output', str(out)]), 0)
+            self.assertEqual(run_episode(root, args, words_json=cache.name, font=FONT, output=out.name), 0)
             self.assertEqual(cache.read_text(), raw)
             self.assertEqual((out/'words.json').read_text(), raw)
             verification = json.loads((out/'verification.json').read_text())
@@ -822,16 +816,16 @@ class MediaSmokeTest(unittest.TestCase):
                 portrait = Image.new('RGB', (90, 100), (204, 144, 106))
                 ImageDraw.Draw(portrait).line((32, 60, 58, 60), fill=(110, 48, 43), width=2)
                 portrait.save(root/f'{name}.png')
-            cache, cfg = root/'input.json', root/'config.json'
+            cache = root/'input.json'
             cache.write_text(json.dumps({'segments': [{'words': [
                 dict(start=0, end=.25, word='Red'), dict(start=.25, end=.5, word=' Blue'),
             ]}]}))
-            cfg.write_text(json.dumps({'mouth_motion': {'A': [.5, .6, .29], 'B': [.5, .6, .29]}}))
-            inputs = {p: p.read_bytes() for p in (audio, cache, cfg, root/'a.png', root/'b.png')}
-            common = args + ['--words-json', str(cache), '--font', FONT, '--preview', '.5']
+            motion = {'A': [.5, .6, .29], 'B': [.5, .6, .29]}
+            inputs = {p: p.read_bytes() for p in (audio, cache, root/'a.png', root/'b.png')}
+            common = args | dict(words_json=cache.name, font=FONT, preview=.5)
             off, on = root/'off', root/'on'
-            self.assertEqual(main(common + ['--output', str(off)]), 0)
-            self.assertEqual(main(common + ['--output', str(on), '--config', str(cfg)]), 0)
+            self.assertEqual(run_episode(root, common, output=off.name), 0)
+            self.assertEqual(run_episode(root, common, output=on.name, mouth_motion=motion), 0)
             check = json.loads((on/'verification.json').read_text())
             self.assertEqual((check['frames'], check['decode']), (12, 'PASS'))
             for name in ('captions.srt', 'audio.m4a', 'words.json'):
@@ -859,20 +853,19 @@ class MediaSmokeTest(unittest.TestCase):
                 wav.writeframes(b'\x01\x00' * 96_000)
             for name in ('a', 'b'):
                 Image.new('RGB', (60, 80), 'green').save(root/f'{name}.png')
-            cache, config = root/'input.json', root/'config.json'
+            cache = root/'input.json'
             cache.write_text(json.dumps({'segments': [{'words': [
                 dict(start=0, end=2, word='Red'), dict(start=2, end=4, word=' blue'),
             ]}]}))
-            config.write_text(json.dumps({'scenes': [
+            args.update(words_json=cache.name, font=FONT, preview=.125, scenes=[
                 dict(first_turn=1, title='First', body='line\n' * 40),
                 dict(first_turn=2, title='Second', body='This fits'),
-            ]}))
-            args += ['--words-json', str(cache), '--font', FONT, '--config', str(config), '--preview', '.125']
+            ])
             outside, inside = root/'outside', root/'inside'
-            self.assertEqual(main(args + ['--output', str(outside), '--preview-start', '2']), 0)
+            self.assertEqual(run_episode(root, args, output=outside.name, preview_start=2), 0)
             self.assertTrue((outside/'preview.mp4').is_file())
             with contextlib.redirect_stderr(io.StringIO()) as error:
-                self.assertEqual(main(args + ['--output', str(inside)]), 1)
+                self.assertEqual(run_episode(root, args, output=inside.name), 1)
             self.assertIn('scene body at 0s does not fit', error.getvalue())
             for name in ('plan.json', 'captions.srt'):
                 self.assertEqual((outside/name).read_bytes(), (inside/name).read_bytes())
@@ -894,13 +887,12 @@ class MediaSmokeTest(unittest.TestCase):
             cache.write_text(json.dumps({'segments': [{'text': 'Red blue', 'words': [
                 dict(start=.9, end=1.01, word='Red'), dict(start=1.01, end=1.03, word=' blue')
             ]}]}))
-            args += ['--words-json', str(cache), '--font', FONT]
+            args.update(words_json=cache.name, font=FONT)
             with contextlib.redirect_stderr(io.StringIO()) as error:
-                self.assertEqual(main(args + ['--output', str(root/'full')]), 1)
+                self.assertEqual(run_episode(root, args, output='full'), 1)
             self.assertRegex(error.getvalue(), r'Caption cue 2 \[1\.01, 1\.03\).*24 fps')
             self.assertFalse((root/'full'/'audio.m4a').exists())
-            self.assertEqual(main(args + ['--output', str(root/'preview'), '--preview-start', '.875',
-                                         '--preview', '.125']), 0)
+            self.assertEqual(run_episode(root, args, output='preview', preview_start=.875, preview=.125), 0)
             self.assertTrue((root/'preview'/'preview.mp4').is_file())
 
     def test_exact_sample_duration_and_touching_turns_render(self):
@@ -918,13 +910,12 @@ class MediaSmokeTest(unittest.TestCase):
                 {'start': .2, 'end': .44, 'word': 'abcdefghi'},
                 {'start': .44, 'end': .7, 'word': ' yes'},
             ]}]}))
-            switches = ['--script', str(p/'script.docx'), '--section', 'Script',
-                        '--narration', str(p/'narration.wav'), '--portrait-a', str(p/'a.png'),
-                        '--portrait-b', str(p/'b.png'), '--words-json', str(p/'input.json'), '--font', FONT]
-            for name, length, mode in [('full', 25, []), ('tail', 13, ['--preview', '1', '--preview-start', '0.5'])]:
+            settings = dict(script='script.docx', section='Script', narration='narration.wav',
+                            portrait_a='a.png', portrait_b='b.png', words_json='input.json', font=FONT)
+            for name, length, mode in [('full', 25, {}), ('tail', 13, dict(preview=1, preview_start=.5))]:
                 with self.subTest(mode=name):
                     out = p/name
-                    self.assertEqual(main(switches + ['--output', str(out)] + mode), 0)
+                    self.assertEqual(run_episode(p, settings, output=out.name, **mode), 0)
                     report = json.loads((out/'verification.json').read_text())
                     self.assertEqual(report['decode'], 'PASS')
                     self.assertEqual(report['frames'], length)
@@ -942,16 +933,14 @@ class MediaSmokeTest(unittest.TestCase):
             src = {'segments': [{'words': [{'start': .2, 'end': 1.1, 'word': 'First'},
                                           {'start': 1.3, 'end': 2.2, 'word': 'Second'}]}]}
             (p / 'input.json').write_text(json.dumps(src))
-            (p / 'config.json').write_text(json.dumps({'scenes': [dict(first_turn=1,last_turn=2,
-                                                title='Concept', body='Input → Output')]}))
-            switches = ['--script', str(p/'script.docx'), '--narration', str(p/'narration.wav'),
-                        '--portrait-a', str(p/'a.png'), '--portrait-b', str(p/'b.png'),
-                        '--words-json', str(p/'input.json'), '--font', FONT, '--config', str(p/'config.json')]
-            runs = [(p/'full','episode.mp4',61,2.50004,[]),
-                    (p/'preview','preview.mp4',24,1.0,['--preview', '1', '--preview-start', '0.5'])]
+            settings = dict(script='script.docx', narration='narration.wav', portrait_a='a.png',
+                            portrait_b='b.png', words_json='input.json', font=FONT,
+                            scenes=[dict(first_turn=1, last_turn=2, title='Concept', body='Input → Output')])
+            runs = [(p/'full', 'episode.mp4', 61, 2.50004, {}),
+                    (p/'preview', 'preview.mp4', 24, 1.0, dict(preview=1, preview_start=.5))]
             for output, filename, frame_count, seconds, mode in runs:
                 with self.subTest(mode=filename):
-                    self.assertEqual(main(switches+['--output',str(output)]+mode), 0)
+                    self.assertEqual(run_episode(p, settings, output=output.name, **mode), 0)
                     self.assertTrue((output / filename).is_file())
                     report = json.loads((output / 'verification.json').read_text())
                     self.assertEqual(report['decode'], 'PASS')
@@ -959,7 +948,7 @@ class MediaSmokeTest(unittest.TestCase):
                     self.assertAlmostEqual(report['audio_seconds'], seconds, delta=.05)
             before = (p/'full/episode.mp4').stat().st_size
             with contextlib.redirect_stderr(io.StringIO()):
-                self.assertEqual(main(switches+['--output',str(p/'full')]), 1)
+                self.assertEqual(run_episode(p, settings, output='full'), 1)
             self.assertEqual((p/'full/episode.mp4').stat().st_size, before)
 
 
