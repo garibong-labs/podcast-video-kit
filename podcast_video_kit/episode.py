@@ -292,12 +292,48 @@ def _word_fields(w, location, duration):
 
 def _boundary_budget(token, effective_start, duration):
     _, _, entry, start, end = token
-    remaining = min(duration, float(entry['end'])) - effective_start
-    used = (float(entry['start']) - start) + (end - float(entry['end']))
-    return max(0.0, min(.04 - used, remaining - max(.02, (end - start) / 2)))
+    current_end = min(duration, float(entry['end']))
+    used = (float(entry['start']) - start) + (min(duration, end) - current_end)
+    return max(0.0, min(.04 - used, current_end - effective_start - max(.02, (end - start) / 2)))
 
 
-def repair_zero_duration(transcript, duration):
+def _shared_gap_limits(tokens, duration):
+    """Work backward to reserve later zero groups' minimum free time."""
+    limits = {}
+    i = len(tokens)
+    while i:
+        anchor = tokens[i - 1][3]
+        if anchor != tokens[i - 1][4]:
+            i -= 1
+            continue
+        end = min(duration, tokens[i][3]) if i < len(tokens) else duration
+        has_later_group = False
+        while i and tokens[i - 1][3] == tokens[i - 1][4]:
+            anchor = tokens[i - 1][3]
+            start = i - 1
+            while start and tokens[start - 1][3] == tokens[start - 1][4] == anchor:
+                start -= 1
+            if has_later_group and end >= anchor - 1e-10:
+                limits[start] = max(anchor, end)
+            end = min(end - .02 * (i - start), anchor)
+            has_later_group, i = True, start
+    return limits
+
+
+def _frame_hits(lo, hi, count, frame_rate):
+    if not frame_rate:
+        return 0
+    edges = [lo + (hi - lo) * n / count for n in range(count)] + [hi]
+    hits = 0
+    for a, b in zip(edges, edges[1:]):
+        frame = math.floor(a * frame_rate)
+        if frame / frame_rate < a:
+            frame += 1
+        hits += frame / frame_rate < b
+    return hits
+
+
+def repair_zero_duration(transcript, duration, *, frame_rate=None):
     """Estimate zero-width nonblank tokens with limited neighboring boundary edits."""
     repaired = deepcopy(transcript)
     tokens = []
@@ -308,6 +344,7 @@ def repair_zero_duration(transcript, duration):
                 tokens.append((i, j, entry, start, end))
 
     estimates, blocked = [], []
+    shared_limits = _shared_gap_limits(tokens, duration)
     previous = 0.0
     previous_start = 0.0
     k = 0
@@ -323,6 +360,7 @@ def repair_zero_duration(transcript, duration):
             stop += 1
         count = stop - k
         following = min(duration, tokens[stop][3]) if stop < len(tokens) else duration
+        following = min(following, shared_limits.get(k, following))
         wanted = .10 * count
         minimum = .02 * count
         lo, hi = max(previous, start - wanted), min(following, start + wanted)
@@ -332,25 +370,42 @@ def repair_zero_duration(transcript, duration):
             # adjacent positive words. Keep at least half and 20 ms of each.
             left = tokens[k - 1] if k and tokens[k - 1][3] < tokens[k - 1][4] else None
             right = tokens[stop] if stop < len(tokens) and tokens[stop][3] < tokens[stop][4] else None
-            left_take = min(deficit, _boundary_budget(left, previous_start, duration)) if left else 0.0
-            right_take = min(deficit - left_take, _boundary_budget(right, following, duration)) if right else 0.0
+            left_room = _boundary_budget(left, previous_start, duration) if left else 0.0
+            right_room = _boundary_budget(right, following, duration) if right else 0.0
+            left_take = min(deficit, left_room)
+            right_take = min(deficit - left_take, right_room)
             if left_take + right_take >= deficit - 1e-10:
+                # At equal trim cost, prefer placement on the render grid.
+                other_right = min(deficit, right_room)
+                other_left = min(deficit - other_right, left_room)
+                if (_frame_hits(lo - other_left, hi + other_right, count, frame_rate)
+                        > _frame_hits(lo - left_take, hi + right_take, count, frame_rate)):
+                    left_take, right_take = other_left, other_right
                 for adjacent, edge, take in ((left, 'end', left_take), (right, 'start', right_take)):
                     if not adjacent or take <= 1e-10:
                         continue
                     seg, idx, entry, _, _ = adjacent
-                    a, b = float(entry['start']), float(entry['end'])
+                    a, source_end = float(entry['start']), float(entry['end'])
+                    b = min(duration, source_end)
                     boundary = lo - take if edge == 'end' else hi + take
                     entry[edge] = boundary
-                    estimates.append(dict(kind='neighbor_boundary', segment=seg, word=idx,
-                                          original_start=a, original_end=b,
-                                          start=float(entry['start']), end=float(entry['end'])))
+                    record = dict(kind='neighbor_boundary', segment=seg, word=idx,
+                                  original_start=a, original_end=b,
+                                  start=float(entry['start']), end=min(duration, float(entry['end'])))
+                    if source_end != b:
+                        record['source_end'] = source_end
+                    estimates.append(record)
                 lo, hi = lo - left_take, hi + right_take
         if previous <= start <= following and hi - lo >= minimum - 1e-10:
-            # Take up to 100 ms per token. Prefer the gap to the left, then
-            # the right; straddle the anchor only if neither side fits alone.
+            # Take up to 100 ms per token. Prefer a usable one-sided gap,
+            # using the left as the tiebreaker; otherwise straddle the anchor.
             if start - lo >= minimum - 1e-10:
-                hi = start
+                if (hi - start >= minimum - 1e-10
+                        and _frame_hits(start, hi, count, frame_rate)
+                        > _frame_hits(lo, start, count, frame_rate)):
+                    lo = start
+                else:
+                    hi = start
             elif hi - start >= minimum - 1e-10:
                 lo = start
             else:

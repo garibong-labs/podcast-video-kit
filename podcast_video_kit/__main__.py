@@ -212,7 +212,7 @@ def build(args):
         (out / 'words.json').write_bytes(raw)
     estimates = []
     if args.repair_zero_duration:
-        transcript, estimates = repair_zero_duration(transcript, float(duration))
+        transcript, estimates = repair_zero_duration(transcript, float(duration), frame_rate=FPS)
     words = read_words(transcript, float(duration))
     if args.words_json:
         (out / 'words.json').write_bytes(raw)

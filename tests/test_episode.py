@@ -611,6 +611,29 @@ class PlanningTests(unittest.TestCase):
                 self.assertAlmostEqual(a, b)
         self.assertEqual(sum(r.get('kind') == 'neighbor_boundary' for r in records), 2)
 
+    def test_distinct_zero_groups_reserve_shared_gap(self):
+        src = dict(segments=[dict(words=[dict(start=a, end=b, word=' x') for a, b in
+                                         ((0, .40), (.40, .40), (.44, .44), (.44, .46))])])
+        repaired, records = repair_zero_duration(src, 1)
+        words = read_words(repaired, 1)
+        for actual, expected in zip(words, ((0, .40), (.40, .42), (.42, .44), (.44, .46))):
+            self.assertAlmostEqual(actual[0], expected[0])
+            self.assertAlmostEqual(actual[1], expected[1])
+        self.assertEqual(len(records), 2)
+        self.assertFalse(any(r.get('kind') == 'neighbor_boundary' for r in records))
+
+    def test_repair_reports_wav_clipping_separately_from_boundary_trim(self):
+        src = dict(segments=[dict(words=[dict(start=0, end=1.20, word='Hi'),
+                                         dict(start=1, end=1, word=' Yes')])])
+        raw = json.dumps(src)
+        repaired, records = repair_zero_duration(src, 1)
+        self.assertEqual(json.dumps(src), raw)
+        self.assertEqual(read_words(repaired, 1)[1][:2], (.98, 1))
+        change = next(r for r in records if r.get('kind') == 'neighbor_boundary')
+        self.assertEqual(change['original_end'], 1)
+        self.assertEqual(change['source_end'], 1.20)
+        self.assertAlmostEqual(change['original_end'] - change['end'], .02)
+
     def test_concepts_preserve_explicit_body_and_reject_overlap(self):
         turns = [dict(start=0, end=3), dict(start=3.5, end=5)]
         item = dict(first_turn=1, last_turn=2, title='Example', body='1 → 2')
@@ -660,6 +683,29 @@ class MediaSmokeTest(unittest.TestCase):
             self.assertEqual(sum(r.get('kind') == 'neighbor_boundary'
                                  for r in plan['estimated_word_timings']), 2)
             self.assertTrue((out/'preview.mp4').is_file())
+
+    def test_standalone_repaired_caption_prefers_a_visible_frame(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            args = cli_fixture(root, ['Script', 'A: Hi', 'B: Yes', 'A: Bye'])
+            with wave.open(str(root/'narration.wav'), 'wb') as wav:
+                wav.setparams((1, 2, 24_000, 0, 'NONE', 'not compressed'))
+                wav.writeframes(b'\x01\x00' * 48_000)
+            for name in ('a', 'b'):
+                Image.new('RGB', (64, 80), 'green').save(root/f'{name}.png')
+            cache = root/'input.json'
+            cache.write_text(json.dumps({'segments': [dict(words=[
+                dict(start=0, end=1, word='Hi'), dict(start=1, end=1, word=' Yes'),
+                dict(start=1, end=2, word=' Bye')])]}))
+            out = root/'preview'
+            self.assertEqual(main(args + ['--words-json', str(cache), '--repair-zero-duration',
+                                          '--font', FONT, '--preview', '2', '--output', str(out)]), 0)
+            plan = json.loads((out/'plan.json').read_text())
+            self.assertEqual(plan['captions'][1], dict(start=1, end=1.02, speaker='B', text='Yes'))
+            verification = json.loads((out/'verification.json').read_text())
+            self.assertEqual(verification['frames'], 48)
+            self.assertEqual(verification['decode'], 'PASS')
 
     def test_preview_passes_with_an_oversized_card_outside_its_window(self):
         from PIL import Image
