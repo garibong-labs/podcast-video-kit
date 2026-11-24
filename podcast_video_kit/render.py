@@ -18,9 +18,10 @@ frame indices limits text layout and frame requests to that window.
 
 Portraits are EXIF-oriented, contain-fitted without cropping visible pixels,
 and composited with alpha over colored mattes. Only the first image of an
-animated source is used. No face detection, mouth deformation, or lip sync:
-the current speaker gets a lit label and a small level meter above the silence
-threshold. The turn, not the RMS, controls the camera; it stays put during
+animated source is used. The current speaker gets a lit label and level meter
+above the silence threshold. Optional ``mouth_motion`` landmarks add cached
+audio-driven poses to that speaker only, not face detection or phoneme lip sync.
+The turn, not the RMS, controls the camera; it stays put during
 brief silence. There is no font fallback; supply a scalable font with glyphs
 and shaping support for the episode's languages. Wrapping keeps the original
 separators within caption lines, normalizes other horizontal whitespace,
@@ -40,7 +41,9 @@ from pathlib import Path
 import re
 import unicodedata
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageOps
+
+from .mouth import Mouth, POSE_COUNT, mouth_level, parse_mouth_motion
 
 
 _SIZE = (1280, 720)
@@ -58,6 +61,8 @@ _MATTE = {
     "A": ((102, 65, 50), (52, 37, 38)),
     "B": ((45, 89, 83), (26, 49, 57)),
 }
+_WIDE_PANELS = {"A": (56, 122, 574, 404, 46), "B": (650, 122, 574, 404, 46)}
+_CLOSE_PANEL = (420, 108, 804, 418, 9)
 
 
 @dataclass(frozen=True)
@@ -130,6 +135,10 @@ def _gradient(size: tuple[int, int], top: tuple, bottom: tuple) -> Image.Image:
 
 
 def _load_portrait(path: Path) -> Image.Image:
+    return _read_portrait(path)[0]
+
+
+def _read_portrait(path, point=None, speaker=None):
     try:
         with Image.open(path) as source:
             portrait = ImageOps.exif_transpose(source).convert("RGBA")
@@ -138,7 +147,8 @@ def _load_portrait(path: Path) -> Image.Image:
     bounds = portrait.getbbox()  # RGBA getbbox uses alpha, not hidden RGB values.
     if bounds is None:
         raise ValueError(f"Cannot use portrait {path}: portrait is fully transparent")
-    return portrait.crop(bounds) if bounds != (0, 0, *portrait.size) else portrait
+    mouth = Mouth.locate(portrait, bounds, point, speaker) if point is not None else None
+    return (portrait.crop(bounds) if bounds != (0, 0, *portrait.size) else portrait), mouth
 
 
 def _wrap(text: str, font: ImageFont.FreeTypeFont, width: int, max_lines: int,
@@ -222,6 +232,7 @@ class Renderer:
         self, portrait_a: Path, portrait_b: Path, font_path: Path, title: str,
         turns: list[dict], cues: list[dict], scenes: list[dict], fps: float = 24,
         *, unmatched_words: Iterable[dict] = (), frame_window: range | None = None,
+        mouth_motion: dict | None = None,
     ) -> None:
         self._fps = float(fps)
         if not (0 < self._fps < math.inf):
@@ -253,10 +264,14 @@ class Renderer:
         for i in scene_indices:
             self._scene_text[i] = self._layout_concept(self._scenes.starts[i], self._scenes.rows[i])
         self._studio = _gradient(_SIZE, (26, 45, 54), (13, 25, 34))
-        studios = {"A": _load_portrait(portrait_a), "B": _load_portrait(portrait_b)}
+        points = parse_mouth_motion(mouth_motion) if mouth_motion is not None else {}
+        studios, mouths = {}, {}
+        for speaker, path in (("A", portrait_a), ("B", portrait_b)):
+            studios[speaker], mouths[speaker] = _read_portrait(path, points.get(speaker), speaker)
         # Seven static frames: idle wide, live wide for either host, and quiet/live
         # close frames for either host. Source images are released after setup.
         self._room_frames = self._make_rooms(studios)
+        self._mouth_patches = self._make_mouth_patches(studios, mouths)
         self._last_scene: tuple[int, Image.Image] | None = None
         self._last_caption: tuple[int, int, Image.Image] | None = None
 
@@ -347,12 +362,12 @@ class Renderer:
         self._header(ImageDraw.Draw(base), "TWO HOSTS   /   2D")
         rooms = {}
         wide = base.copy()
-        for x, speaker in ((56, "A"), (650, "B")):
-            self._panel(wide, portraits[speaker], speaker, x, 122, 574, 404, inset=46)
+        for speaker, panel in _WIDE_PANELS.items():
+            self._panel(wide, portraits[speaker], speaker, *panel)
         rooms["wide", ""] = wide
-        for x, speaker in ((56, "A"), (650, "B")):
+        for speaker, panel in _WIDE_PANELS.items():
             hot = wide.copy()
-            self._panel_label(hot, speaker, x, 122, 574, 404, True)
+            self._panel_label(hot, speaker, *panel[:4], True)
             rooms["wide", speaker] = hot
 
             # The close is a larger uncropped view of the same asset, not a
@@ -364,21 +379,45 @@ class Renderer:
             self._label(draw, 94, 215, "IN CONVERSATION", _MUTED)
             self._label(draw, 88, 301, speaker, _ACCENT[speaker], 132)
             self._label(draw, 94, 390, f"SPEAKER {speaker}  /  CLOSE", _LIGHT)
-            self._panel(close, portraits[speaker], speaker, 420, 108, 804, 418, inset=9)
+            self._panel(close, portraits[speaker], speaker, *_CLOSE_PANEL)
             rooms[speaker, ""] = close
             hot = close.copy()
-            self._panel_label(hot, speaker, 420, 108, 804, 418, True)
+            self._panel_label(hot, speaker, *_CLOSE_PANEL[:4], True)
             rooms[speaker, speaker] = hot
         return rooms
+
+    @staticmethod
+    def _tile_geometry(x: int, y: int, w: int, h: int) -> tuple[tuple[int, int], tuple[int, int]]:
+        return (x + 14, y + 14), (w - 28, h - 67)
 
     def _panel(self, frame: Image.Image, portrait: Image.Image, speaker: str,
                x: int, y: int, w: int, h: int, inset: int) -> None:
         draw = ImageDraw.Draw(frame)
         draw.rounded_rectangle((x, y, x + w - 1, y + h - 1), radius=20,
                                fill="#1a3039", outline="#48636a", width=2)
-        tile = self._portrait_tile(portrait, speaker, (w - 28, h - 67), inset)
-        frame.paste(tile, (x + 14, y + 14))
+        origin, size = self._tile_geometry(x, y, w, h)
+        tile = self._portrait_tile(portrait, speaker, size, inset)
+        frame.paste(tile, origin)
         self._panel_label(frame, speaker, x, y, w, h, False)
+
+    def _make_mouth_patches(self, portraits, mouths):
+        patches = {}
+        for speaker, mouth in mouths.items():
+            if mouth is None:
+                continue
+            portrait = portraits[speaker]
+            views = [(view, *self._tile_geometry(x, y, w, h), inset)
+                     for view, (x, y, w, h, inset) in
+                     (("wide", _WIDE_PANELS[speaker]), (speaker, _CLOSE_PANEL))]
+            resting = [self._portrait_tile(portrait, speaker, size, inset)
+                       for _, _, size, inset in views]
+            for level in range(1, POSE_COUNT):
+                posed = mouth.pose(portrait, level)
+                for (view, (x, y), size, inset), rest in zip(views, resting):
+                    tile = self._portrait_tile(posed, speaker, size, inset)
+                    if (box := ImageChops.difference(rest, tile).getbbox()) is not None:
+                        patches[view, speaker, level] = tile.crop(box), (x + box[0], y + box[1])
+        return patches
 
     def _panel_label(self, frame: Image.Image, speaker: str, x: int, y: int,
                      w: int, h: int, live: bool) -> None:
@@ -400,8 +439,13 @@ class Renderer:
         speaker = self._turns.rows[i]["speaker"]
         close = (time - self._turns.starts[i]) % 6.0 >= 0.60
         live = math.isfinite(rms) and rms >= _SILENCE_RMS
-        frame = self._room_frames[speaker if close else "wide", speaker if live else ""].copy()
+        view = speaker if close else "wide"
+        frame = self._room_frames[view, speaker if live else ""].copy()
         if live:
+            if self._mouth_patches:
+                patch = self._mouth_patches.get((view, speaker, mouth_level(rms, _SILENCE_RMS)))
+                if patch is not None:
+                    frame.paste(*patch)
             draw = ImageDraw.Draw(frame)
             right = 630 if not close and speaker == "A" else 1224
             lit = min(6, 1 + int(min(1.0, rms) * 28))

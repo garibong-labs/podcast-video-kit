@@ -6,7 +6,8 @@ import unittest
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont
 
-from podcast_video_kit.render import Renderer, _load_portrait, _wrap
+from podcast_video_kit.render import Renderer, _load_portrait, _read_portrait, _wrap
+from podcast_video_kit.mouth import Mouth, mouth_level, parse_mouth_motion
 
 
 _A = (241, 29, 174)
@@ -108,6 +109,96 @@ class RendererTests(unittest.TestCase):
         self.assertIsNotNone(ImageChops.difference(
             returned.crop(caption_zone), renderer.frame(96, 0.12).crop(caption_zone)
         ).getbbox())
+
+    def test_mouth_moves_only_on_the_speaking_portrait_and_uses_absolute_time(self):
+        options = dict(turns=[turn(0, 7, 'A'), turn(7, 9, 'B')],
+                       cues=[cue(0, 9, 'A', 'Caption')], scenes=[scene(2, 4)],
+                       unmatched_words=[dict(start=8, end=8.25)])
+        points = {'A': (.5, .58, .25), 'B': (.5, .58, .25)}
+        plain = self.renderer(**options)
+        motion = self.renderer(**options, mouth_motion=points)
+        only_a = self.renderer(**options, mouth_motion={'A': points['A']})
+        preview = self.renderer(**options, mouth_motion=points, frame_window=range(165, 171))
+        for i, region in ((14, (294, 300, 391, 348)), (15, (756, 301, 885, 367)),
+                          (143, (756, 301, 885, 367)), (144, (294, 300, 391, 348)),
+                          (167, (756, 301, 885, 367)), (168, (889, 300, 986, 348))):
+            with self.subTest(frame=i):
+                frame = motion.frame(i, .2)
+                box = ImageChops.difference(plain.frame(i, .2), frame).getbbox()
+                self.assertIsNotNone(box)
+                self.assertTrue(region[0] <= box[0] < box[2] <= region[2] and
+                                region[1] <= box[1] < box[3] <= region[3], box)
+                for rms in (0, 262 / 32768, float('nan'), float('inf')):
+                    self.assertSamePixels(plain.frame(i, rms), motion.frame(i, rms))
+        self.assertIsNotNone(ImageChops.difference(plain.frame(15, 263 / 32768),
+                                                   motion.frame(15, 263 / 32768)).getbbox())
+        self.assertSamePixels(plain.frame(168, .2), only_a.frame(168, .2))
+        for i in (72, 192, 216):  # opaque concept, unmatched word, and turn gap
+            self.assertSamePixels(plain.frame(i, .2), motion.frame(i, .2))
+        for i in range(165, 171):
+            self.assertSamePixels(motion.frame(i, .2), preview.frame(i, .2))
+        self.assertIsNotNone(ImageChops.difference(plain.frame(51, .2), motion.frame(51, .2)).getbbox())
+        self.assertSamePixels(plain.frame(51, .2).crop((56, 542, 1224, 702)),
+                              motion.frame(51, .2).crop((56, 542, 1224, 702)))
+
+    def test_cached_mouth_uses_the_same_tile_geometry_as_the_panel(self):
+        class ShiftedRenderer(Renderer):
+            @staticmethod
+            def _tile_geometry(x, y, w, h):
+                return (x + 30, y + 21), (w - 64, h - 91)
+
+        point = (.5, .58, .25)
+        renderer = ShiftedRenderer(self.a, self.b, self.font, 'Test episode',
+                                   [turn(0, 2, 'A')], [], [], mouth_motion={'A': point})
+        portrait, mouth = _read_portrait(self.a, point, 'A')
+        for frame, panel in ((0, (56, 122, 574, 404, 46)),
+                             (24, (420, 108, 804, 418, 9))):
+            with self.subTest(frame=frame):
+                (x, y), (w, h) = renderer._tile_geometry(*panel[:4])
+                box = (x, y, x + w, y + h)
+                expected = renderer._portrait_tile(mouth.pose(portrait, 3), 'A', (w, h), panel[4])
+                self.assertSamePixels(expected, renderer.frame(frame, .2).crop(box))
+
+    def test_large_mouth_cavity_has_antialiased_edges_before_upscaling(self):
+        portrait = Image.new('RGBA', (240, 150), (220, 220, 220, 255))
+        mouth = Mouth.locate(portrait, (0, 0, 240, 150), (.5, .5, .45), 'A')
+        self.assertGreaterEqual(mouth.width, 100)
+        posed = mouth.pose(portrait, 3)
+        # Uniform input isolates the cavity mask from lip texture and resampling.
+        center_band = posed.crop((100, 61, 140, 89)).getchannel('R')
+        self.assertTrue(any(80 <= shade <= 200 for shade in center_band.tobytes()))
+
+    def test_mouth_landmarks_follow_exif_and_preserve_alpha(self):
+        original = Image.new('RGBA', (110, 150), (255, 0, 222, 0))
+        draw = ImageDraw.Draw(original)
+        draw.ellipse((22, 7, 89, 135), fill=(60, 180, 90, 255))
+        draw.line((61, 110, 83, 110), fill=(100, 40, 30, 255), width=3)
+        point = (72/110, 110/150, 22/110)
+        original.save(self.a)
+        options = dict(turns=[turn(0, 2, 'A')], mouth_motion={'A': point})
+        control = self.renderer(**options)
+        bounds = original.getbbox()
+        cropped = original.crop(bounds)
+        mouth = Mouth.locate(original, bounds, point, 'A')
+        posed = mouth.pose(cropped, 3)
+        self.assertSamePixels(cropped.getchannel('A'), posed.getchannel('A'))
+        self.assertEqual(posed.getpixel((mouth.box[2]-1, mouth.box[3]-1)),
+                         cropped.getpixel((mouth.box[2]-1, mouth.box[3]-1)))
+        for orientation, inverse in ((6, Image.Transpose.ROTATE_90), (7, Image.Transpose.TRANSVERSE)):
+            exif = Image.Exif()
+            exif[274] = orientation
+            original.transpose(inverse).save(self.a, exif=exif)
+            transformed = self.renderer(**options)
+            for i in (2, 24):
+                self.assertSamePixels(control.frame(i, .2), transformed.frame(i, .2))
+
+    def test_mouth_config_rejects_bad_values_and_pose_levels_are_bounded(self):
+        for point in ((True, .5, .2), (.5, float('inf'), .2), (.5, .5, 0), (-.1, .5, .2)):
+            with self.subTest(point=point), self.assertRaisesRegex(ValueError, r'mouth_motion\.A'):
+                parse_mouth_motion({'A': point})
+        with self.assertRaisesRegex(ValueError, r'mouth_motion\.B'):
+            self.renderer(mouth_motion={'B': (.05, .05, .20)})
+        self.assertEqual([mouth_level(rms, .008) for rms in (0, .008, .032, .4, 2)], [0, 1, 2, 3, 3])
 
     def test_adjacent_and_one_frame_concept_cards_do_not_reveal_portraits(self):
         renderer = self.renderer(

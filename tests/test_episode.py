@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -805,6 +806,48 @@ class MediaSmokeTest(unittest.TestCase):
             self.assertEqual(verification['frames'], (samples + 999) // 1000)
             self.assertEqual(verification['decode'], 'PASS')
             return json.loads((out/'plan.json').read_text())['captions']
+
+    def test_preview_with_optional_mouth_motion_encodes_without_changing_inputs(self):
+        from PIL import Image, ImageChops, ImageDraw
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            args = cli_fixture(root, ['Script', 'A: Red', 'B: Blue'])
+            audio = root/'narration.wav'
+            with wave.open(str(audio), 'wb') as wav:
+                wav.setparams((1, 2, 24_000, 0, 'NONE', 'not compressed'))
+                for volume in (4000, 0, 5000, 0):
+                    wav.writeframes(b''.join((volume if i % 80 < 40 else -volume)
+                                             .to_bytes(2, 'little', signed=True) for i in range(3000)))
+            for name in ('a', 'b'):
+                portrait = Image.new('RGB', (90, 100), (204, 144, 106))
+                ImageDraw.Draw(portrait).line((32, 60, 58, 60), fill=(110, 48, 43), width=2)
+                portrait.save(root/f'{name}.png')
+            cache, cfg = root/'input.json', root/'config.json'
+            cache.write_text(json.dumps({'segments': [{'words': [
+                dict(start=0, end=.25, word='Red'), dict(start=.25, end=.5, word=' Blue'),
+            ]}]}))
+            cfg.write_text(json.dumps({'mouth_motion': {'A': [.5, .6, .29], 'B': [.5, .6, .29]}}))
+            inputs = {p: p.read_bytes() for p in (audio, cache, cfg, root/'a.png', root/'b.png')}
+            common = args + ['--words-json', str(cache), '--font', FONT, '--preview', '.5']
+            off, on = root/'off', root/'on'
+            self.assertEqual(main(common + ['--output', str(off)]), 0)
+            self.assertEqual(main(common + ['--output', str(on), '--config', str(cfg)]), 0)
+            check = json.loads((on/'verification.json').read_text())
+            self.assertEqual((check['frames'], check['decode']), (12, 'PASS'))
+            for name in ('captions.srt', 'audio.m4a', 'words.json'):
+                self.assertEqual((off/name).read_bytes(), (on/name).read_bytes())
+            self.assertEqual(inputs, {p: p.read_bytes() for p in inputs})
+
+            def decoded(folder, index):
+                raw = subprocess.check_output(['ffmpeg', '-v', 'error', '-i', str(folder/'preview.mp4'),
+                                               '-vf', f'select=eq(n\\,{index})', '-frames:v', '1',
+                                               '-pix_fmt', 'rgb24', '-f', 'rawvideo', 'pipe:1'])
+                return Image.frombytes('RGB', (1280, 720), raw)
+
+            for frame, x in ((0, 343), (6, 937)):
+                box = (x-15, 318, x+15, 338)
+                diff = ImageChops.difference(decoded(off, frame).crop(box), decoded(on, frame).crop(box))
+                self.assertGreater(max(high for _, high in diff.getextrema()), 25)
 
     def test_preview_passes_with_an_oversized_card_outside_its_window(self):
         from PIL import Image
