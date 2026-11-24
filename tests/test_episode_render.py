@@ -6,7 +6,7 @@ import unittest
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont
 
-from podcast_video_kit.render import Renderer, _load_portrait, _wrap
+from podcast_video_kit.render import Renderer, _load_portrait, _read_portrait, _wrap
 from podcast_video_kit.mouth import Mouth, mouth_level, parse_mouth_motion
 
 
@@ -140,6 +140,33 @@ class RendererTests(unittest.TestCase):
         self.assertIsNotNone(ImageChops.difference(plain.frame(51, .2), motion.frame(51, .2)).getbbox())
         self.assertSamePixels(plain.frame(51, .2).crop((56, 542, 1224, 702)),
                               motion.frame(51, .2).crop((56, 542, 1224, 702)))
+
+    def test_cached_mouth_uses_the_same_tile_geometry_as_the_panel(self):
+        class ShiftedRenderer(Renderer):
+            @staticmethod
+            def _tile_geometry(x, y, w, h):
+                return (x + 30, y + 21), (w - 64, h - 91)
+
+        point = (.5, .58, .25)
+        renderer = ShiftedRenderer(self.a, self.b, self.font, 'Test episode',
+                                   [turn(0, 2, 'A')], [], [], mouth_motion={'A': point})
+        portrait, mouth = _read_portrait(self.a, point, 'A')
+        for frame, panel in ((0, (56, 122, 574, 404, 46)),
+                             (24, (420, 108, 804, 418, 9))):
+            with self.subTest(frame=frame):
+                (x, y), (w, h) = renderer._tile_geometry(*panel[:4])
+                box = (x, y, x + w, y + h)
+                expected = renderer._portrait_tile(mouth.pose(portrait, 3), 'A', (w, h), panel[4])
+                self.assertSamePixels(expected, renderer.frame(frame, .2).crop(box))
+
+    def test_large_mouth_cavity_has_antialiased_edges_before_upscaling(self):
+        portrait = Image.new('RGBA', (240, 150), (220, 220, 220, 255))
+        mouth = Mouth.locate(portrait, (0, 0, 240, 150), (.5, .5, .45), 'A')
+        self.assertGreaterEqual(mouth.width, 100)
+        posed = mouth.pose(portrait, 3)
+        # Uniform input isolates the cavity mask from lip texture and resampling.
+        center_band = posed.crop((100, 61, 140, 89)).getchannel('R')
+        self.assertTrue(any(80 <= shade <= 200 for shade in center_band.tobytes()))
 
     def test_mouth_landmarks_follow_exif_and_preserve_alpha(self):
         original = Image.new('RGBA', (110, 150), (255, 0, 222, 0))

@@ -386,13 +386,18 @@ class Renderer:
             rooms[speaker, speaker] = hot
         return rooms
 
+    @staticmethod
+    def _tile_geometry(x: int, y: int, w: int, h: int) -> tuple[tuple[int, int], tuple[int, int]]:
+        return (x + 14, y + 14), (w - 28, h - 67)
+
     def _panel(self, frame: Image.Image, portrait: Image.Image, speaker: str,
                x: int, y: int, w: int, h: int, inset: int) -> None:
         draw = ImageDraw.Draw(frame)
         draw.rounded_rectangle((x, y, x + w - 1, y + h - 1), radius=20,
                                fill="#1a3039", outline="#48636a", width=2)
-        tile = self._portrait_tile(portrait, speaker, (w - 28, h - 67), inset)
-        frame.paste(tile, (x + 14, y + 14))
+        origin, size = self._tile_geometry(x, y, w, h)
+        tile = self._portrait_tile(portrait, speaker, size, inset)
+        frame.paste(tile, origin)
         self._panel_label(frame, speaker, x, y, w, h, False)
 
     def _make_mouth_patches(self, portraits, mouths):
@@ -401,7 +406,7 @@ class Renderer:
             if mouth is None:
                 continue
             portrait = portraits[speaker]
-            views = [(view, (x + 14, y + 14), (w - 28, h - 67), inset)
+            views = [(view, *self._tile_geometry(x, y, w, h), inset)
                      for view, (x, y, w, h, inset) in
                      (("wide", _WIDE_PANELS[speaker]), (speaker, _CLOSE_PANEL))]
             resting = [self._portrait_tile(portrait, speaker, size, inset)

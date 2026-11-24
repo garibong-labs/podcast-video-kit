@@ -58,10 +58,7 @@ class Mouth:
             warped.paste(strip.resize((width, stretched[i+1]-stretched[i]),
                                       Image.Resampling.BILINEAR), (0, stretched[i]))
 
-        def ellipse_mask(rx, ry):
-            # Supersample small spots; high-resolution source patches already
-            # get antialiasing when they are reduced to the portrait tile.
-            scale = 2 if self.width < 100 else 1
+        def ellipse_mask(rx, ry, scale):
             mask = Image.new('L', (width*scale, height*scale))
             ImageDraw.Draw(mask).ellipse(tuple(round(n*scale) for n in
                                               (cx-rx, cy-ry, cx+rx, cy+ry)), fill=255)
@@ -70,8 +67,9 @@ class Mouth:
         color = rgb.getpixel((int(cx), int(cy)))
         cavity = Image.new('RGB', patch.size, tuple(round(c * .30) for c in color))
         texture = Image.composite(warped.convert('RGB'), rgb, warped.getchannel('A'))
-        texture = Image.composite(cavity, texture, ellipse_mask(self.width*.40, opening*.82))
-        mask = ellipse_mask(self.width*.60, self.width*.32)
+        # Close views can enlarge a portrait even when its mouth is wide in source pixels.
+        texture = Image.composite(cavity, texture, ellipse_mask(self.width*.40, opening*.82, 2))
+        mask = ellipse_mask(self.width*.60, self.width*.32, 2 if self.width < 100 else 1)
         # A soft boundary keeps stationary skin and hair unchanged beyond the patch.
         mask = mask.filter(ImageFilter.GaussianBlur(max(.5, self.width*.028)))
         alpha = patch.getchannel('A')
