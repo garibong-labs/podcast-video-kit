@@ -442,7 +442,10 @@ class Renderer:
         start, end = self._turns.starts[i], self._turns.ends[i]
         # Leave a full wide lead-in between close-ups, and only cut in when
         # the remaining time can hold a close-up for at least as long.
-        close = end >= start + 2 * _STUDIO_HOLD_SECONDS and time >= start + _STUDIO_HOLD_SECONDS
+        min_end = start + 2 * _STUDIO_HOLD_SECONDS
+        # An exact six-second interval can land just below min_end as floats.
+        long_enough = end >= min_end or math.isclose(end, min_end, rel_tol=0, abs_tol=1e-12)
+        close = long_enough and time >= start + _STUDIO_HOLD_SECONDS
         live = (math.isfinite(rms) and rms >= _SILENCE_RMS
                 and self._unmatched_words.at(time) < 0)
         view = speaker if close else "wide"

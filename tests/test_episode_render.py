@@ -81,6 +81,20 @@ class RendererTests(unittest.TestCase):
             with self.subTest(close=index):
                 self.assertEqual(renderer.frame(index, 0).getpixel((822, 297)), color)
 
+    def test_fractional_six_second_cutoff(self):
+        # Both intervals span the same 144 sampled frames, but only one is 6 s.
+        for end, qualifies in ((6.56, True), (6.559, False)):
+            with self.subTest(end=end):
+                renderer = self.renderer(turns=[turn(.56, end, "A")])
+                wide = renderer.frame(14, .2)
+                self.assertEqual(wide.getpixel((937, 304)), _B)
+                for index in range(14, 158):
+                    frame = renderer.frame(index, .2)
+                    if qualifies and index >= 86:
+                        self.assertEqual(frame.getpixel((822, 297)), _A, index)
+                    else:
+                        self.assertEqual(frame.getpixel((937, 304)), _B, index)
+
     def test_unmatched_word_keeps_close_without_speaker_activation(self):
         renderer = self.renderer(turns=[turn(0, 9, "A")],
                                  unmatched_words=[dict(start=4, end=4.125)],
