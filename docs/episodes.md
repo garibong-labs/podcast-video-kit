@@ -34,11 +34,15 @@ Numbered dialogue and nested list notes can stay in the section. Word paragraphs
 
 The aligner matches normalized character runs against timestamped words. The script limit of 30,000 normalized characters is checked before transcription. The same limit applies to ASR word text after transcription. If a segment supplies text, its timed words must account for that text after case, punctuation, and spacing normalization. Caches that omit segment text are supported. The aligner reports per-turn coverage, lists turns below 60%, and fails if no anchors exist for a turn or overall script coverage falls below 50%. Coverage measures matched text. Unmatched speech appears without a speaker label, including between two words matched to the same speaker.
 
-During the exact time span of a spoken word with no matched characters, the studio uses the neutral wide shot and leaves both speaker indicators idle. Captions keep their own display timing.
+During the exact time span of a spoken word with no matched characters, the studio keeps the planned shot but leaves the speaker indicators idle. Captions keep their own display timing.
 
 By default, a nonblank word with equal start and end times gets a bounded estimate. Repair uses nearby free time first; each neighboring word can lend up to 40 ms total while retaining at least half its original duration and at least 20 ms. The planner reserves time for later repairs and checks alternative placements against the full-video frame grid when needed. It keeps the WAV and raw cache unchanged. Review warnings and `estimated_word_timings` in `plan.json`; in a `neighbor_boundary` record, `source_end` (when present) is the raw end, and `original_end` is the WAV-clipped end before the repair trim. `"timing_mode": "strict"` rejects zero-duration words without estimating. If a bounded repair is impossible, correct a private copy of the cache and retry.
 
 Each caption cue that overlaps the selected render window must be visible on at least one frame at 24 fps. If a cue falls between frames, the render error gives the cue number and time range. Adjust the word timing or preview bounds and retry. Preview text fitting covers the captions and cards visible in that preview. Review warnings and play back the preview before rendering the full recording.
+
+## Studio camera cuts
+
+No setting is needed. Turns shorter than 6 seconds stay in the two-host wide shot. For turns of at least 6 seconds, the camera holds wide for the first 3 seconds, then holds a single close-up until the turn ends. Brief quiet or unmatched speech within a turn does not trigger a cut. Scripted concept cards retain their own timing, and a preview or recording boundary may truncate a shot. Camera cuts do not change audio, caption timing, or when mouth motion is active.
 
 ## Optional mouth motion
 
