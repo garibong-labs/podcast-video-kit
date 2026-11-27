@@ -432,8 +432,8 @@ class PlanningTests(unittest.TestCase):
                         expected = (neutral if unknown else live).frame(index, .8)
                         self.assertEqual(frame.mode, 'RGB')
                         self.assertIsNone(ImageChops.difference(frame, expected).getbbox())
-                        # Close-up A meter at this time, or the idle wide layout.
-                        self.assertEqual(frame.getpixel((1130, 499)) == (255, 203, 129), not unknown)
+                        # The short turn stays wide; only A's meter switches off.
+                        self.assertEqual(frame.getpixel((536, 499)) == (255, 203, 129), not unknown)
                 return dict(mode='full', frames=48)
 
             out = root/'render'

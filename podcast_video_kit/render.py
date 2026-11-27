@@ -12,8 +12,8 @@ and cues use logical speaker ``A`` or ``B``; cues include ``text`` and may use
 multiline ``body``, and optional ``kind`` (a literal label, not a template
 selector). No values are calculated and no content is inferred.
 Captions follow their own timeline, including across scene cuts and silence.
-Pass exact unmatched-word intervals as ``unmatched_words`` to use the neutral
-studio shot during those intervals. An optional ``frame_window`` of absolute
+Pass exact unmatched-word intervals as ``unmatched_words`` to suppress speaker
+activity, without changing the camera. An optional ``frame_window`` of absolute
 frame indices limits text layout and frame requests to that window.
 
 Portraits are EXIF-oriented, contain-fitted without cropping visible pixels,
@@ -21,9 +21,10 @@ and composited with alpha over colored mattes. Only the first image of an
 animated source is used. The current speaker gets a lit label and level meter
 above the silence threshold. Optional ``mouth_motion`` landmarks add cached
 audio-driven poses to that speaker only, not face detection or phoneme lip sync.
-The turn, not the RMS, controls the camera; it stays put during
-brief silence. There is no font fallback; supply a scalable font with glyphs
-and shaping support for the episode's languages. Wrapping keeps the original
+Short turns stay wide; longer turns allow one close-up after a wide lead-in.
+RMS and ASR gaps within a turn never change the shot. There is no font
+fallback; supply a scalable font with glyphs and shaping support for the
+episode's languages. Wrapping keeps the original
 separators within caption lines, normalizes other horizontal whitespace,
 preserves explicit newlines, and may split an overwide token. If
 copy still cannot fit at the minimum type size, construction raises ValueError
@@ -48,6 +49,7 @@ from .mouth import Mouth, POSE_COUNT, mouth_level, parse_mouth_motion
 
 _SIZE = (1280, 720)
 _SILENCE_RMS = 0.008  # Linear full-scale PCM, about -42 dBFS.
+_STUDIO_HOLD_SECONDS = 3
 _CONCEPT_TITLE_Y = 183
 _CONCEPT_BODY_GAP = 25
 _CONCEPT_TEXT_BOTTOM = 505
@@ -434,11 +436,18 @@ class Renderer:
 
     def _room(self, time: float, rms: float) -> Image.Image:
         i = self._turns.at(time)
-        if i < 0 or self._unmatched_words.at(time) >= 0:
+        if i < 0:
             return self._room_frames["wide", ""].copy()
         speaker = self._turns.rows[i]["speaker"]
-        close = (time - self._turns.starts[i]) % 6.0 >= 0.60
-        live = math.isfinite(rms) and rms >= _SILENCE_RMS
+        start, end = self._turns.starts[i], self._turns.ends[i]
+        # Leave a full wide lead-in between close-ups, and only cut in when
+        # the remaining time can hold a close-up for at least as long.
+        min_end = start + 2 * _STUDIO_HOLD_SECONDS
+        # An exact six-second interval can land just below min_end as floats.
+        long_enough = end >= min_end or math.isclose(end, min_end, rel_tol=0, abs_tol=1e-12)
+        close = long_enough and time >= start + _STUDIO_HOLD_SECONDS
+        live = (math.isfinite(rms) and rms >= _SILENCE_RMS
+                and self._unmatched_words.at(time) < 0)
         view = speaker if close else "wide"
         frame = self._room_frames[view, speaker if live else ""].copy()
         if live:

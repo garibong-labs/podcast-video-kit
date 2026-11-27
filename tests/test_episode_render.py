@@ -51,11 +51,11 @@ class RendererTests(unittest.TestCase):
         self.assertIsNone(ImageChops.difference(a, b).getbbox())
 
     def test_wide_close_and_speaker_mapping(self):
-        renderer = self.renderer(turns=[turn(2, 4, "B"), turn(0, 2, "A")])
+        renderer = self.renderer(turns=[turn(6, 13, "B"), turn(0, 6, "A")])
         a_wide = renderer.frame(0, 0.10)
-        b_wide = renderer.frame(48, 0.10)
-        a_close = renderer.frame(24, 0.10)
-        b_close = renderer.frame(72, 0.10)
+        b_wide = renderer.frame(144, 0.10)
+        a_close = renderer.frame(72, 0.10)
+        b_close = renderer.frame(216, 0.10)
         for frame in (a_wide, b_wide, a_close, b_close):
             self.assertEqual(frame.size, (1280, 720))
             self.assertEqual(frame.mode, "RGB")
@@ -68,10 +68,47 @@ class RendererTests(unittest.TestCase):
         self.assertEqual(pixel_count(b_close, _A), 0)
         self.assertGreater(pixel_count(a_close, _A), pixel_count(a_wide, _A))
 
+    def test_short_turns_stay_wide_and_long_turns_hold_the_close(self):
+        renderer = self.renderer(turns=[turn(0, 5.96, "A"), turn(6, 7, "B"),
+                                        turn(7, 19, "A"), turn(19, 25, "B")])
+        for index in (15, 120, 144, 167, 239, 456, 527, 600):
+            with self.subTest(wide=index):
+                frame = renderer.frame(index, 0)
+                self.assertEqual(frame.getpixel((343, 304)), _A)
+                self.assertEqual(frame.getpixel((937, 304)), _B)
+        for index, color in ((240, _A), (312, _A), (313, _A), (455, _A),
+                             (528, _B), (599, _B)):
+            with self.subTest(close=index):
+                self.assertEqual(renderer.frame(index, 0).getpixel((822, 297)), color)
+
+    def test_fractional_six_second_cutoff(self):
+        # Both intervals span the same 144 sampled frames, but only one is 6 s.
+        for end, qualifies in ((6.56, True), (6.559, False)):
+            with self.subTest(end=end):
+                renderer = self.renderer(turns=[turn(.56, end, "A")])
+                wide = renderer.frame(14, .2)
+                self.assertEqual(wide.getpixel((937, 304)), _B)
+                for index in range(14, 158):
+                    frame = renderer.frame(index, .2)
+                    if qualifies and index >= 86:
+                        self.assertEqual(frame.getpixel((822, 297)), _A, index)
+                    else:
+                        self.assertEqual(frame.getpixel((937, 304)), _B, index)
+
+    def test_unmatched_word_keeps_close_without_speaker_activation(self):
+        renderer = self.renderer(turns=[turn(0, 9, "A")],
+                                 unmatched_words=[dict(start=4, end=4.125)],
+                                 mouth_motion={"A": (.5, .58, .25)})
+        quiet_close = renderer.frame(95, 0)
+        self.assertEqual(quiet_close.getpixel((822, 297)), _A)
+        for index in (96, 97, 98):
+            self.assertSamePixels(renderer.frame(index, .2), quiet_close)
+        self.assertIsNotNone(ImageChops.difference(renderer.frame(99, .2), quiet_close).getbbox())
+
     def test_silence_gates_indicator_without_jitter_or_non_speaker_motion(self):
-        renderer = self.renderer(turns=[turn(0, 2, "A")])
-        idle = renderer.frame(48, 0)
-        self.assertSamePixels(idle, renderer.frame(48, 0.80))
+        renderer = self.renderer(turns=[turn(0, 6, "A")])
+        idle = renderer.frame(144, 0)
+        self.assertSamePixels(idle, renderer.frame(144, 0.80))
         quiet = renderer.frame(10, 0.0079)
         self.assertSamePixels(idle, quiet)
         live = renderer.frame(10, 0.008)
@@ -80,19 +117,19 @@ class RendererTests(unittest.TestCase):
                               live.crop((649, 110, 1225, 527)))
         self.assertSamePixels(quiet.crop((70, 136, 616, 473)),
                               live.crop((70, 136, 616, 473)))
-        close_quiet = renderer.frame(24, 0)
-        close_live = renderer.frame(24, 0.5)
+        close_quiet = renderer.frame(72, 0)
+        close_live = renderer.frame(72, 0.5)
         for frame in (close_quiet, close_live):
             self.assertEqual(frame.getpixel((822, 297)), _A)
-        self.assertSamePixels(close_quiet, renderer.frame(24, float("nan")))
+        self.assertSamePixels(close_quiet, renderer.frame(72, float("nan")))
 
     def test_concept_entry_core_exit_and_independent_captions(self):
         renderer = self.renderer(
-            turns=[turn(0, 5, "A")], cues=[cue(1, 4, "B", "Example caption")],
-            scenes=[scene(2, 3)],
+            turns=[turn(0, 10, "A")], cues=[cue(3, 6, "B", "Example caption")],
+            scenes=[scene(4, 5)],
         )
         entry, entering, core, leaving, returned = [
-            renderer.frame(i, 0.12) for i in (48, 51, 60, 69, 72)
+            renderer.frame(i, 0.12) for i in (96, 99, 108, 117, 120)
         ]
         sample = (822, 297)
         self.assertEqual(entry.getpixel(sample), _A)
@@ -102,26 +139,26 @@ class RendererTests(unittest.TestCase):
         self.assertNotEqual(entering.getpixel(sample), _A)
         self.assertNotEqual(entering.getpixel(sample), core.getpixel(sample))
         self.assertEqual(entering.getpixel(sample), leaving.getpixel(sample))
-        self.assertSamePixels(core, renderer.frame(60, 0))
+        self.assertSamePixels(core, renderer.frame(108, 0))
         caption_zone = (56, 542, 1224, 702)
         for frame in (entry, entering, leaving, returned):
             self.assertSamePixels(core.crop(caption_zone), frame.crop(caption_zone))
         self.assertIsNotNone(ImageChops.difference(
-            returned.crop(caption_zone), renderer.frame(96, 0.12).crop(caption_zone)
+            returned.crop(caption_zone), renderer.frame(144, 0.12).crop(caption_zone)
         ).getbbox())
 
     def test_mouth_moves_only_on_the_speaking_portrait_and_uses_absolute_time(self):
-        options = dict(turns=[turn(0, 7, 'A'), turn(7, 9, 'B')],
-                       cues=[cue(0, 9, 'A', 'Caption')], scenes=[scene(2, 4)],
+        options = dict(turns=[turn(0, 10, 'A'), turn(10, 12, 'B')],
+                       cues=[cue(0, 12, 'A', 'Caption')], scenes=[scene(2, 4)],
                        unmatched_words=[dict(start=8, end=8.25)])
         points = {'A': (.5, .58, .25), 'B': (.5, .58, .25)}
         plain = self.renderer(**options)
         motion = self.renderer(**options, mouth_motion=points)
         only_a = self.renderer(**options, mouth_motion={'A': points['A']})
-        preview = self.renderer(**options, mouth_motion=points, frame_window=range(165, 171))
-        for i, region in ((14, (294, 300, 391, 348)), (15, (756, 301, 885, 367)),
-                          (143, (756, 301, 885, 367)), (144, (294, 300, 391, 348)),
-                          (167, (756, 301, 885, 367)), (168, (889, 300, 986, 348))):
+        preview = self.renderer(**options, mouth_motion=points, frame_window=range(238, 244))
+        for i, region in ((14, (294, 300, 391, 348)), (96, (756, 301, 885, 367)),
+                          (143, (756, 301, 885, 367)), (144, (756, 301, 885, 367)),
+                          (239, (756, 301, 885, 367)), (240, (889, 300, 986, 348))):
             with self.subTest(frame=i):
                 frame = motion.frame(i, .2)
                 box = ImageChops.difference(plain.frame(i, .2), frame).getbbox()
@@ -132,10 +169,10 @@ class RendererTests(unittest.TestCase):
                     self.assertSamePixels(plain.frame(i, rms), motion.frame(i, rms))
         self.assertIsNotNone(ImageChops.difference(plain.frame(15, 263 / 32768),
                                                    motion.frame(15, 263 / 32768)).getbbox())
-        self.assertSamePixels(plain.frame(168, .2), only_a.frame(168, .2))
-        for i in (72, 192, 216):  # opaque concept, unmatched word, and turn gap
+        self.assertSamePixels(plain.frame(240, .2), only_a.frame(240, .2))
+        for i in (72, 192, 288):  # opaque concept, unmatched word, and turn gap
             self.assertSamePixels(plain.frame(i, .2), motion.frame(i, .2))
-        for i in range(165, 171):
+        for i in range(238, 244):
             self.assertSamePixels(motion.frame(i, .2), preview.frame(i, .2))
         self.assertIsNotNone(ImageChops.difference(plain.frame(51, .2), motion.frame(51, .2)).getbbox())
         self.assertSamePixels(plain.frame(51, .2).crop((56, 542, 1224, 702)),
@@ -149,10 +186,10 @@ class RendererTests(unittest.TestCase):
 
         point = (.5, .58, .25)
         renderer = ShiftedRenderer(self.a, self.b, self.font, 'Test episode',
-                                   [turn(0, 2, 'A')], [], [], mouth_motion={'A': point})
+                                   [turn(0, 6, 'A')], [], [], mouth_motion={'A': point})
         portrait, mouth = _read_portrait(self.a, point, 'A')
         for frame, panel in ((0, (56, 122, 574, 404, 46)),
-                             (24, (420, 108, 804, 418, 9))):
+                             (72, (420, 108, 804, 418, 9))):
             with self.subTest(frame=frame):
                 (x, y), (w, h) = renderer._tile_geometry(*panel[:4])
                 box = (x, y, x + w, y + h)
